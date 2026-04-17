@@ -99,7 +99,7 @@ def probe_path(base_url: str, path: str, timeout: int, ua: str,
                 ct = result["content_type"].lower()
                 if "text/html" in ct:
                     result["interesting"] = True
-                    result["note"]        = "HTML — XSS candidate"
+                    result["note"]        = "HTML"
                 elif "json" in ct:
                     result["interesting"] = True
                     result["note"]        = "JSON API"
