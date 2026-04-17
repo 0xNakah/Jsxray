@@ -8,7 +8,7 @@ BANNER = r"""
  _  | \__ \  X | '_/ _` | || |
 | |_| |___/ / \|_| \__,_|\_, |
  \___/     /_/\_\         |__/
- XSS Intelligence Engine v0.2
+ XSS Intelligence Engine v0.1
 """
 
 HEADERS = {
