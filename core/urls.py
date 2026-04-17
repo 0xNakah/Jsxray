@@ -5,6 +5,9 @@ FIX 4:  Before calling uro to deduplicate the full URL pool we now extract
         every unique query-parameter name from the raw (pre-uro) list and
         store them in ctx.pre_uro_params.  probe.py will inject each of
         those params onto the root URL so nothing discovered pre-dedup is lost.
+
+FIX 5:  Add xnLinkFinder as a URL source (standard + full modes).
+        Runs: xnLinkFinder -i <target_url> -sp <target_url> -sf -siv -o -
 """
 
 import os, shutil, subprocess, requests
@@ -36,7 +39,6 @@ _BLOCK_PHRASES = [
 
 
 def is_blocked(html: str, status_code) -> bool:
-    """Return True if the response looks like a WAF/bot-block page."""
     if status_code == 403:
         return True
     text = html.lower()
@@ -175,6 +177,27 @@ def run_katana(target_url, timeout):
     )
 
 
+def run_xnlinkfinder(target_url, timeout):
+    """Run xnLinkFinder against target_url.
+    Outputs one URL per line to stdout; we filter for http(s) lines.
+    -sf  = stop at first found
+    -siv = skip invalid SSL
+    -sp  = scope prefix (stay in-scope)
+    -o - = write to stdout
+    """
+    return run_tool(
+        [
+            "xnLinkFinder",
+            "-i",  target_url,
+            "-sp", target_url,
+            "-sf",
+            "-siv",
+            "-o",  "-",
+        ],
+        timeout,
+    )
+
+
 # ── Phase runner ──────────────────────────────────────────────────────────────
 
 def run(ctx, phase_num=3, total=9):
@@ -203,13 +226,14 @@ def run(ctx, phase_num=3, total=9):
     results = {}
 
     sources = {
-        "wayback_cdx": (fetch_wayback_cdx, [domain,          ctx.timeout]),
-        "urlscan":     (fetch_urlscan,     [domain,          ctx.timeout]),
-        "gau":         (run_tool,          [["gau", "--timeout", str(ctx.timeout),
-                                             "--retries", "2", domain], ctx.timeout]),
-        "waybackurls": (run_tool,          [["waybackurls", domain],    ctx.timeout]),
-        "waymore":     (run_tool,          [["waymore", "-i", domain, "-mode", "U",
-                                             "-oU", "-"],               ctx.timeout]),
+        "wayback_cdx":   (fetch_wayback_cdx,   [domain,          ctx.timeout]),
+        "urlscan":       (fetch_urlscan,        [domain,          ctx.timeout]),
+        "gau":           (run_tool,             [["gau", "--timeout", str(ctx.timeout),
+                                                  "--retries", "2", domain], ctx.timeout]),
+        "waybackurls":   (run_tool,             [["waybackurls", domain],    ctx.timeout]),
+        "waymore":       (run_tool,             [["waymore", "-i", domain, "-mode", "U",
+                                                  "-oU", "-"],               ctx.timeout]),
+        "xnlinkfinder":  (run_xnlinkfinder,     [ctx.target_url,  ctx.timeout]),
     }
     if mode == "full":
         sources["katana"] = (run_katana, [ctx.target_url, ctx.timeout])
@@ -231,12 +255,13 @@ def run(ctx, phase_num=3, total=9):
 
     # Merge all sources
     ordered = [
-        results.get("wayback_cdx",  []),
-        results.get("urlscan",      []),
-        results.get("waymore",      []),
-        results.get("gau",          []),
-        results.get("waybackurls",  []),
-        results.get("katana",       []),
+        results.get("wayback_cdx",   []),
+        results.get("urlscan",       []),
+        results.get("waymore",       []),
+        results.get("gau",           []),
+        results.get("waybackurls",   []),
+        results.get("xnlinkfinder",  []),
+        results.get("katana",        []),
         [r.get("resolved_url") or r["url"]
          for r in ctx.robots_live if r.get("status") == 200],
         getattr(ctx, "sitemap_urls", []),
