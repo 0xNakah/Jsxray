@@ -19,16 +19,16 @@ arjun = "arjun"
 uro = "uro"
 
 [mode.quick]
-phases = ["intake","robots","js_discovery","js_extract","probe","score","output"]
+phases = ["intake","robots","js_discovery","js_extract","output"]
 
 [mode.standard]
-phases = ["intake","robots","urls","js_discovery","js_extract","deep","probe","score","output"]
+phases = ["intake","robots","urls","js_discovery","js_extract","deep","output"]
 
 [mode.full]
-phases = ["intake","subdomains","robots","urls","js_discovery","js_extract","deep","probe","score","output"]
+phases = ["intake","subdomains","robots","urls","js_discovery","js_extract","deep","output"]
 
 [mode.watch]
-phases = ["intake","robots","urls","js_discovery","js_extract","probe","score","output","monitor"]
+phases = ["intake","robots","urls","js_discovery","js_extract","output","monitor"]
 
 [alerts]
 discord_webhook = ""
