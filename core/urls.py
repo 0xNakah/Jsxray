@@ -6,8 +6,8 @@ FIX 4:  Before calling uro to deduplicate the full URL pool we now extract
         store them in ctx.pre_uro_params.  probe.py will inject each of
         those params onto the root URL so nothing discovered pre-dedup is lost.
 
-FIX 5:  Add xnLinkFinder as a URL source (standard + full modes).
-        Runs: xnLinkFinder -i <target_url> -sp <target_url> -sf -siv -o -
+NOTE:   xnLinkFinder has been moved to core/crawl.py (runs after deep)
+        so it is seeded with the full, source-map-augmented URL pool.
 """
 
 import os, shutil, subprocess, requests
@@ -28,7 +28,6 @@ SKIP_STRINGS = [
     "node_modules", "/__hmr",
 ]
 
-# Phrases that indicate a WAF/bot-block page
 _BLOCK_PHRASES = [
     "access denied", "403 forbidden", "blocked",
     "captcha", "are you a human", "security check",
@@ -82,7 +81,6 @@ def merge_and_filter(batches, domain):
     return unique
 
 
-# ── FIX 4: extract param names from ALL URLs before uro deduplication ────────
 def harvest_params_pre_uro(urls):
     """Return every query-param name seen across the raw (pre-uro) URL list."""
     params = set()
@@ -177,27 +175,6 @@ def run_katana(target_url, timeout):
     )
 
 
-def run_xnlinkfinder(target_url, timeout):
-    """Run xnLinkFinder against target_url.
-    Outputs one URL per line to stdout; we filter for http(s) lines.
-    -sf  = stop at first found
-    -siv = skip invalid SSL
-    -sp  = scope prefix (stay in-scope)
-    -o - = write to stdout
-    """
-    return run_tool(
-        [
-            "xnLinkFinder",
-            "-i",  target_url,
-            "-sp", target_url,
-            "-sf",
-            "-siv",
-            "-o",  "-",
-        ],
-        timeout,
-    )
-
-
 # ── Phase runner ──────────────────────────────────────────────────────────────
 
 def run(ctx, phase_num=3, total=9):
@@ -205,7 +182,6 @@ def run(ctx, phase_num=3, total=9):
     domain = (parsed.netloc if parsed and parsed.netloc else ctx.target).lstrip("www.")
     mode   = getattr(ctx, "mode", "standard")
 
-    # Quick mode: skip tool harvest, still harvest pre-uro params from seeds
     if mode == "quick":
         pre = harvest_params_pre_uro(ctx.url_pool)
         existing = set(getattr(ctx, "js_global_params", []))
@@ -233,7 +209,6 @@ def run(ctx, phase_num=3, total=9):
         "waybackurls":   (run_tool,             [["waybackurls", domain],    ctx.timeout]),
         "waymore":       (run_tool,             [["waymore", "-i", domain, "-mode", "U",
                                                   "-oU", "-"],               ctx.timeout]),
-        "xnlinkfinder":  (run_xnlinkfinder,     [ctx.target_url,  ctx.timeout]),
     }
     if mode == "full":
         sources["katana"] = (run_katana, [ctx.target_url, ctx.timeout])
@@ -253,14 +228,12 @@ def run(ctx, phase_num=3, total=9):
                 results[name] = []
                 print(f"[urls]   {name:<15} → ERROR: {e}")
 
-    # Merge all sources
     ordered = [
         results.get("wayback_cdx",   []),
         results.get("urlscan",       []),
         results.get("waymore",       []),
         results.get("gau",           []),
         results.get("waybackurls",   []),
-        results.get("xnlinkfinder",  []),
         results.get("katana",        []),
         [r.get("resolved_url") or r["url"]
          for r in ctx.robots_live if r.get("status") == 200],
@@ -270,8 +243,6 @@ def run(ctx, phase_num=3, total=9):
     merged = merge_and_filter(ordered, domain)
     print(f"[urls]   merged (pre-uro)  → {len(merged):>5} URLs")
 
-    # FIX 4: harvest param names from the full pre-uro set BEFORE uro strips
-    #         duplicate-param variants (e.g. ?q=1 and ?q=2 both contribute "q")
     pre_params = harvest_params_pre_uro(merged)
     existing   = set(getattr(ctx, "js_global_params", []))
     ctx.pre_uro_params = sorted(pre_params - existing)

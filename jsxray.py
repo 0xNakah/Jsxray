@@ -12,7 +12,7 @@ from core.config  import load_config, get_phases_for_mode
 
 VALID_PHASES = [
     "intake","subdomains","robots","urls",
-    "js_discovery","js_extract","deep",
+    "js_discovery","js_extract","deep","crawl",
     "probe","score","output","monitor"
 ]
 
@@ -27,6 +27,7 @@ Modes:
               Fast, self-contained, no gau/katana/waymore required.
 
   standard  → quick + urls phase (waymore/gau/waybackurls) + deep (x8/arjun)
+              + crawl (xnLinkFinder, seeded from full pool after deep)
               Best for bug bounty: max param coverage with passive sources.
 
   full      → standard + subdomains (subfinder/httpx)
@@ -69,7 +70,6 @@ def build_phase_list(args, config):
         skip   = {p.strip() for p in args.skip_phases.split(",")}
         phases = [p for p in phases if p not in skip]
 
-    # intake and output are always present
     if "intake" not in phases:  phases.insert(0, "intake")
     if "output" not in phases:  phases.append("output")
     return phases
@@ -83,6 +83,7 @@ def run_phase(phase_name, ctx, phase_num, total):
         "js_discovery": "core.js_discovery",
         "js_extract":   "core.js_extract",
         "deep":         "core.deep",
+        "crawl":        "core.crawl",
         "probe":        "core.probe",
         "score":        "core.score",
         "output":       "core.output",

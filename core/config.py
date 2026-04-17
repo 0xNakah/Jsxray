@@ -12,29 +12,30 @@ DEFAULT_CONFIG = {
         "output_dir":   "recon",
         "port":         5000,
         "open_browser": True,
-        "timeout":      60,           # 1 minute default
+        "timeout":      60,
         "user_agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     },
     "tools": {
-        "katana":      "katana",
-        "subfinder":   "subfinder",
-        "gau":         "gau",
-        "waybackurls": "waybackurls",
-        "waymore":     "waymore",
-        "httpx":       "httpx",
-        "x8":          "x8",
-        "arjun":       "arjun",
-        "uro":         "uro",
+        "katana":         "katana",
+        "subfinder":      "subfinder",
+        "gau":            "gau",
+        "waybackurls":    "waybackurls",
+        "waymore":        "waymore",
+        "httpx":          "httpx",
+        "x8":             "x8",
+        "arjun":          "arjun",
+        "uro":            "uro",
+        "xnLinkFinder":   "xnLinkFinder",
     },
     "mode": {
-        # quick: NO external tools. robots.txt → pages → JS → params. Fast.
+        # quick: no external tools — robots → JS → params. Fast.
         "quick":    {"phases": ["intake","robots","js_discovery","js_extract","probe","score","output"]},
-        # standard: adds tool-based URL harvest + deep param discovery
-        "standard": {"phases": ["intake","robots","urls","js_discovery","js_extract","deep","probe","score","output"]},
+        # standard: passive harvest + deep + active crawl
+        "standard": {"phases": ["intake","robots","urls","js_discovery","js_extract","deep","crawl","probe","score","output"]},
         # full: subdomains + everything
-        "full":     {"phases": ["intake","subdomains","robots","urls","js_discovery","js_extract","deep","probe","score","output"]},
+        "full":     {"phases": ["intake","subdomains","robots","urls","js_discovery","js_extract","deep","crawl","probe","score","output"]},
         # watch: standard + monitor diff
-        "watch":    {"phases": ["intake","robots","urls","js_discovery","js_extract","probe","score","output","monitor"]},
+        "watch":    {"phases": ["intake","robots","urls","js_discovery","js_extract","deep","crawl","probe","score","output","monitor"]},
     },
     "alerts": {
         "discord_webhook":  "",
