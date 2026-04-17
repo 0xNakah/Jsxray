@@ -6,7 +6,8 @@ Strategy (quick / no-tools):
   2. Fetch each live robots.txt page → extract <script src=...>
   3. Fetch sitemap-seeded pages (up to N) → extract <script src=...>
   4. Wayback CDX passive JS URL lookup (no target contact)
-  5. For each JS URL: check for .map source map
+  5. Pull .js URLs already in ctx.url_pool (built by urls phase)
+  6. For each JS URL: check for .map source map
 
 Standard/full modes add:
   - Chunk pattern enumeration (common Next.js / webpack chunk paths)
@@ -48,6 +49,8 @@ CHUNK_PATTERNS_WEBPACK = [
     "/assets/js/main.js",
 ]
 
+JS_EXT_RE = re.compile(r'\.js(\?[^#]*)?$', re.IGNORECASE)
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _resolve(ref, base_url):
@@ -78,16 +81,13 @@ def check_source_map(js_url, timeout, ua):
                          allow_redirects=True)
         if r.status_code != 200:
             return None
-        # Header-based source map
         sm = r.headers.get("SourceMap", "") or r.headers.get("X-SourceMap", "")
         if sm:
             return urljoin(js_url, sm)
-        # Comment-based source map at end of file
         tail = r.text[-800:] if len(r.text) > 800 else r.text
         m = MAP_COMMENT.search(tail)
         if m:
             return urljoin(js_url, m.group(1))
-        # Try .map extension directly
         map_url = js_url.split("?")[0] + ".map"
         rm = requests.head(map_url, timeout=timeout,
                            headers={"User-Agent": ua}, allow_redirects=True)
@@ -141,6 +141,14 @@ def try_chunk_patterns(base_url, tech_stack, timeout, ua):
             pass
     return found
 
+def _is_js_url(url):
+    """Return True if URL path ends in .js (ignoring query string)."""
+    try:
+        path = urlparse(url).path
+        return bool(JS_EXT_RE.search(path))
+    except Exception:
+        return False
+
 # ── Phase runner ──────────────────────────────────────────────────────────────
 
 def run(ctx: Context, phase_num=4, total=9) -> Context:
@@ -152,28 +160,24 @@ def run(ctx: Context, phase_num=4, total=9) -> Context:
     ctx.log(f"[js_discovery] Base: {base_url}  mode={mode}")
 
     # ── Step 1: Seed pages to crawl for <script src=...> ─────────────────────
-    # Priority: canonical root > live robots pages > sitemap URLs (up to 30)
     seed_pages = [base_url]
 
-    # Add all live robots pages (resolved URLs)
     for r in ctx.robots_live:
         if r.get("status") == 200:
             seed_pages.append(r.get("resolved_url") or r["url"])
 
-    # Add sitemap URLs (cap at 30 for speed)
     seed_pages += ctx.sitemap_urls[:30]
 
-    # Add url_pool pages that have query params (more likely to be interesting)
     for u in ctx.url_pool[:50]:
         if "?" in u:
             seed_pages.append(u)
 
-    seed_pages = list(dict.fromkeys(seed_pages))  # dedup, preserve order
+    seed_pages = list(dict.fromkeys(seed_pages))
     ctx.log(f"[js_discovery] Scanning {len(seed_pages)} seed pages for JS refs...")
 
     # ── Step 2: Parallel page fetch → JS ref extraction ──────────────────────
-    js_refs    = set()
-    blocked    = 0
+    js_refs  = set()
+    blocked  = 0
     pages_done = 0
 
     with ThreadPoolExecutor(max_workers=20) as ex:
@@ -203,31 +207,26 @@ def run(ctx: Context, phase_num=4, total=9) -> Context:
         ctx.log(f"[js_discovery]   Chunk patterns → {len(chunk_js)} found")
         js_refs.update(chunk_js)
 
-    # ── Step 5: Filter to in-scope JS files ──────────────────────────────────
-    # Accept same domain, CDNs hosting target's JS, and well-known CDNs
+    # ── Step 5: Drain .js URLs already in ctx.url_pool (built by urls phase) ──
+    pool_js = [u for u in ctx.url_pool if _is_js_url(u)]
+    ctx.log(f"[js_discovery]   url_pool .js drain → {len(pool_js)} URLs")
+    js_refs.update(pool_js)
+
+    # ── Step 6: Filter to in-scope JS files ──────────────────────────────────
     in_scope = []
-    cdn_hosts = {"cdn.", "static.", "assets.", "js.", "scripts."}
     for url in js_refs:
         try:
-            p    = urlparse(url)
-            host = p.netloc.lower()
+            host = urlparse(url).netloc.lower()
             bare = domain.lower()
-            # Same domain or subdomain
-            if host == bare or host.endswith("." + bare):
+            if host == bare or host.endswith("." + bare) or bare in host:
                 in_scope.append(url)
-                continue
-            # Known CDN subdomains of target
-            if bare in host:
-                in_scope.append(url)
-                continue
         except Exception:
             pass
 
-    # Dedup
     in_scope = list(dict.fromkeys(in_scope))
     ctx.log(f"[js_discovery]   In-scope JS files: {len(in_scope)}")
 
-    # ── Step 6: Source map detection (parallel) ───────────────────────────────
+    # ── Step 7: Source map detection (parallel) ───────────────────────────────
     ctx.log(f"[js_discovery] Checking {len(in_scope)} JS files for source maps...")
     source_maps = {}
 
@@ -254,5 +253,5 @@ def run(ctx: Context, phase_num=4, total=9) -> Context:
     ctx.phases_run.append("js_discovery")
     ctx.log_phase_done(phase_num, total, "js_discovery",
         f"{len(in_scope)} JS files | {len(source_maps)} source maps | "
-        f"{len(wayback_js)} from Wayback")
+        f"{len(wayback_js)} from Wayback | {len(pool_js)} from url_pool")
     return ctx
