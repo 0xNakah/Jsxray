@@ -1,16 +1,17 @@
 """
 js_extract.py — JS Parameter & Endpoint Extraction
 
-For each discovered JS file:
-  - Fetch the file (or decompress source map)
-  - Extract URL endpoints (LinkFinder-style regex + custom patterns)
-  - Extract GET/POST parameter names
-  - Flag high-value params (redirect, query, search, url, callback, etc.)
-  - Aggregate into ctx.js_param_map and ctx.js_global_params
+Fixes applied
+─────────────
+FIX 4a  Add destructuring patterns:
+         const { q, page, sort } = params / query / req.query / req.body
+FIX 4b  Add FormData.append("name", ...) / fd.append("name", ...)
+FIX 4c  Add axios({ params: { q, page } }) object-shorthand keys
+FIX 4d  Add JSON.stringify({ q, page }) object-literal keys
 """
 
 import re, requests, json
-from urllib.parse import urljoin, urlparse, unquote
+from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from core.context import Context
 
@@ -20,72 +21,120 @@ HEADERS = {
     "Accept":          "*/*",
 }
 
-# ── High-value param names ────────────────────────────────────────────────────
-
 HIGH_VALUE_PARAMS = {
-    # Redirect / SSRF
     "redirect","redirect_uri","redirect_url","redirecturl","redirecturi",
     "return","returnurl","returnuri","return_url","return_uri",
     "next","continue","forward","goto","dest","destination",
     "target","ref","referer","referrer","back","location","url","uri",
-    # XSS sinks
     "q","query","search","keyword","keywords","term","terms","text",
     "input","msg","message","content","comment","description","title",
     "subject","body","note","name","value","data","payload",
-    # Template / injection
     "template","view","page","layout","format","theme","style",
     "lang","language","locale","currency","country","region",
-    # Debug
     "debug","test","preview","mode","dev","verbose","trace",
-    # Auth
     "token","state","code","nonce","scope","response_type",
-    # Upload / path
     "file","filename","path","dir","folder","upload","attachment",
-    # Callback
     "callback","cb","jsonp","handler","fn",
 }
 
-# ── Regex patterns ─────────────────────────────────────────────────────────────
-
-# Endpoint patterns — various JS assignment/string styles
+# ── Endpoint patterns ─────────────────────────────────────────────────────────
 ENDPOINT_PATTERNS = [
-    # Fetch / XHR / axios
-    re.compile(r'''(?:fetch|axios(?:\.\w+)?|http\.(?:get|post|put|delete|patch))\s*\(\s*['"`]([^'"`\s]{3,}(?:/[^'"`\s]*)?)['"`]'''),
-    # string with /api/, /v1/, etc.
-    re.compile(r'''['"`](/(?:api|v\d+|rest|graphql|ajax|service|data|endpoint|query)[^'"`\s]{0,100})['"`]'''),
-    # Relative paths with params
-    re.compile(r'''['"`](/[a-zA-Z0-9_\-./]{3,80}\?[a-zA-Z0-9_\-=&%+.]{2,100})['"`]'''),
-    # Full URL strings in JS
-    re.compile(r'''['"`](https?://[^'"`\s]{10,200})['"`]'''),
-    # Router-style paths
-    re.compile(r'''(?:path|route|url|href|src|action)\s*[:=]\s*['"`](/[^'"`\s]{2,80})['"`]'''),
+    re.compile(
+        r"""(?:fetch|axios(?:\.\w+)?|http\.(?:get|post|put|delete|patch))\s*"""
+        r"""\(\s*['"`]([^'"`\s]{3,}(?:/[^'"`\s]*)?)['"`]"""
+    ),
+    re.compile(r"""['"`](/(?:api|v\d+|rest|graphql|ajax|service|data|endpoint|query)[^'"`\s]{0,100})['"`]"""),
+    re.compile(r"""['"`](/[a-zA-Z0-9_\-./]{3,80}\?[a-zA-Z0-9_\-=&%+.]{2,100})['"`]"""),
+    re.compile(r"""['"`](https?://[^'"`\s]{10,200})['"`]"""),
+    re.compile(r"""(?:path|route|url|href|src|action)\s*[:=]\s*['"`](/[^'"`\s]{2,80})['"`]"""),
 ]
 
-# Parameter name extraction
-PARAM_PATTERNS = [
-    # URLSearchParams
-    re.compile(r'''(?:searchParams|URLSearchParams|params)\s*\.(?:get|append|set|has)\s*\(\s*['"`]([a-zA-Z0-9_\-]{1,40})['"`]'''),
-    # query string assignments: ?param=  &param=
-    re.compile(r'''[?&]([a-zA-Z0-9_\-]{1,40})='''),
-    # Object key access for query: params.foo, query.foo, qs.foo
-    re.compile(r'''(?:params|query|qs|req\.query|args|opts)\s*[.\[]\s*['"`]?([a-zA-Z0-9_\-]{1,40})['"`]?'''),
-    # Request body keys
-    re.compile(r'''(?:body|payload|data|form)\s*[.\[]\s*['"`]([a-zA-Z0-9_\-]{1,40})['"`]'''),
-    # Direct assignment: const q = params.q
-    re.compile(r'''const\s+([a-zA-Z0-9_]{1,30})\s*=\s*(?:params|query|searchParams)'''),
-    # GraphQL variable names
-    re.compile(r'''\$([a-zA-Z0-9_]{1,30})\s*:\s*(?:String|Int|Boolean|ID|Float)'''),
+# ── Single-name parameter patterns ───────────────────────────────────────────
+PARAM_SINGLE = [
+    # URLSearchParams .get / .set / .append / .has
+    re.compile(
+        r"""(?:searchParams|URLSearchParams|params)\s*"""
+        r"""\.(?:get|append|set|has)\s*\(\s*['"`]([a-zA-Z0-9_\-]{1,40})['"`]"""
+    ),
+    # query string  ?param=  &param=
+    re.compile(r"""[?&]([a-zA-Z0-9_\-]{1,40})="""),
+    # object property access: params.foo  query["foo"]  req.query.foo
+    re.compile(
+        r"""(?:params|query|qs|req\.query|args|opts)\s*[.\[]\s*['"`]?"""
+        r"""([a-zA-Z0-9_\-]{1,40})['"`]?"""
+    ),
+    # body / payload access: body.foo  data["key"]
+    re.compile(r"""(?:body|payload|data|form)\s*[.\[]\s*['"`]([a-zA-Z0-9_\-]{1,40})['"`]"""),
+    # const q = params.q  (captures the var name, same as the param)
+    re.compile(r"""(?:const|let|var)\s+([a-zA-Z0-9_]{1,30})\s*=\s*(?:params|query|searchParams)\s*\."""),
+    # GraphQL: $variable: String
+    re.compile(r"""\$([a-zA-Z0-9_]{1,30})\s*:\s*(?:String|Int|Boolean|ID|Float)"""),
+    # ── FIX 4b: FormData.append("name", ...)  fd.append('name', ...)
+    re.compile(r"""(?:formData|formdata|form|fd|new\s+FormData\s*\(\s*\))\s*\.append\s*\(\s*['"`]([a-zA-Z0-9_\-]{1,40})['"`]"""),
+    # generic .append('name', ...) chains
+    re.compile(r"""\.append\s*\(\s*['"`]([a-zA-Z0-9_\-]{1,40})['"`]"""),
+    # data-* attribute names inside templates / JSX
+    re.compile(r"""data-([a-zA-Z0-9_\-]{1,40})="""),
 ]
 
-# API key / secret hints (flag but don't extract value)
+# ── Block patterns (destructuring / object literals) ─────────────────────────
+PARAM_BLOCK = [
+    # FIX 4a: const { q, page, sort } = params / query / req.query / req.body
+    re.compile(
+        r"""(?:const|let|var)\s*\{([^}]{1,300})\}\s*=\s*"""
+        r"""(?:params|query|searchParams|req\.query|req\.body|qs|body|payload)"""
+    ),
+    # FIX 4c: axios({ params: { q, page } }) — object shorthand inside params key
+    re.compile(r"""params\s*:\s*\{([^}]{1,300})\}"""),
+    # FIX 4d: fetch body  JSON.stringify({ q, page, sort })
+    re.compile(r"""JSON\.stringify\s*\(\s*\{([^}]{1,300})\}\s*\)"""),
+    # qs.stringify({ q, page }) — common axios / node pattern
+    re.compile(r"""qs\.stringify\s*\(\s*\{([^}]{1,300})\}\s*\)"""),
+]
+
 SECRET_PATTERNS = [
-    re.compile(r'''(?:api[_\-]?key|apikey|secret|token|auth[_\-]?key|access[_\-]?key)\s*[:=]\s*['"`]([A-Za-z0-9\-_./+]{10,80})['"`]''', re.IGNORECASE),
+    re.compile(
+        r"""(?:api[_\-]?key|apikey|secret|token|auth[_\-]?key|access[_\-]?key)"""
+        r"""\s*[:=]\s*['"`]([A-Za-z0-9\-_./+]{10,80})['"`]""",
+        re.IGNORECASE,
+    ),
 ]
 
-# ── Fetch helpers ─────────────────────────────────────────────────────────────
+
+# ── Block parsers ─────────────────────────────────────────────────────────────
+
+def _parse_destructure(block):
+    """Extract names from  { q, page, sort = 'asc', search: alias }."""
+    names = []
+    for token in block.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        # aliasing:  { search: alias } → take alias (right-hand side)
+        if ":" in token:
+            token = token.split(":", 1)[1]
+        # default value:  sort = 'asc'
+        if "=" in token:
+            token = token.split("=", 1)[0]
+        name = token.strip().strip("'\"`; ")
+        if re.match(r"^[a-zA-Z][a-zA-Z0-9_\-]{0,39}$", name):
+            names.append(name.lower())
+    return names
+
+
+def _parse_object_keys(block):
+    """Extract key names from  { q, page: val, sort: fn() }."""
+    names = []
+    for token in block.split(","):
+        key = token.strip().split(":")[0].strip().strip("'\"`; ")
+        if re.match(r"^[a-zA-Z][a-zA-Z0-9_\-]{0,39}$", key):
+            names.append(key.lower())
+    return names
+
+
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 def fetch_js(url, timeout, ua):
-    """Fetch a JS file and return its text content."""
     try:
         r = requests.get(url, timeout=timeout,
                          headers={**HEADERS, "User-Agent": ua},
@@ -96,71 +145,72 @@ def fetch_js(url, timeout, ua):
         pass
     return ""
 
+
 def fetch_source_map(map_url, timeout, ua):
-    """Fetch a .map file and reconstruct original source text."""
     try:
         r = requests.get(map_url, timeout=timeout,
                          headers={**HEADERS, "User-Agent": ua},
                          allow_redirects=True)
         if r.status_code == 200:
-            data = r.json()
-            sources_content = data.get("sourcesContent", [])
-            # Combine all source files into one big text blob for regex
-            combined = "\n\n".join(
-                s for s in sources_content if s and isinstance(s, str)
-            )
+            data    = r.json()
+            sources = data.get("sourcesContent", [])
+            combined = "\n\n".join(s for s in sources if s and isinstance(s, str))
             return combined if combined else r.text
     except Exception:
         pass
     return ""
 
-# ── Extraction ────────────────────────────────────────────────────────────────
+
+# ── Core extraction ───────────────────────────────────────────────────────────
 
 def extract_endpoints(text, base_url):
     endpoints = set()
     for pattern in ENDPOINT_PATTERNS:
         for m in pattern.finditer(text):
             ep = m.group(1).strip()
-            # Normalise
-            if ep.startswith("http"):
-                endpoints.add(ep)
-            elif ep.startswith("/"):
-                full = urljoin(base_url, ep)
-                endpoints.add(full)
+            endpoints.add(ep if ep.startswith("http") else urljoin(base_url, ep))
     return list(endpoints)
+
 
 def extract_params(text):
     params = set()
-    for pattern in PARAM_PATTERNS:
+
+    # Single-name patterns
+    for pattern in PARAM_SINGLE:
         for m in pattern.finditer(text):
             name = m.group(1).strip()
-            # sanity filter
-            if 2 <= len(name) <= 40 and re.match(r'^[a-zA-Z][a-zA-Z0-9_\-]*$', name):
+            if 2 <= len(name) <= 40 and re.match(r"^[a-zA-Z][a-zA-Z0-9_\-]*$", name):
                 params.add(name.lower())
+
+    # Block patterns — destructuring + object literals  (FIX 4a/4c/4d)
+    for pattern in PARAM_BLOCK:
+        for m in pattern.finditer(text):
+            block = m.group(1)
+            for name in _parse_destructure(block):
+                if 2 <= len(name) <= 40:
+                    params.add(name)
+            for name in _parse_object_keys(block):
+                if 2 <= len(name) <= 40:
+                    params.add(name)
+
     return list(params)
+
 
 def extract_secrets(text, js_url):
     secrets = []
     for pattern in SECRET_PATTERNS:
         for m in pattern.finditer(text):
             value = m.group(1)
-            # skip obviously fake/templated values
-            if not re.match(r'^[xX\*<>{}|]+$', value):
+            if not re.match(r"^[xX\*<>{}|]+$", value):
                 secrets.append({"url": js_url, "match": m.group(0)[:120]})
     return secrets
 
-def process_js_file(js_url, map_url, base_url, timeout, ua):
-    """Process one JS file (and its source map if available)."""
-    result = {
-        "url":       js_url,
-        "map_url":   map_url,
-        "endpoints": [],
-        "params":    [],
-        "secrets":   [],
-        "source":    "js",
-    }
 
-    # Prefer source map if available (richer content)
+def process_js_file(js_url, map_url, base_url, timeout, ua):
+    result = {
+        "url": js_url, "map_url": map_url,
+        "endpoints": [], "params": [], "secrets": [], "source": "js",
+    }
     if map_url:
         text = fetch_source_map(map_url, timeout, ua)
         result["source"] = "sourcemap"
@@ -178,9 +228,10 @@ def process_js_file(js_url, map_url, base_url, timeout, ua):
     result["secrets"]   = extract_secrets(text, js_url)
     return result
 
+
 # ── Phase runner ──────────────────────────────────────────────────────────────
 
-def run(ctx: Context, phase_num=5, total=9) -> Context:
+def run(ctx, phase_num=5, total=9):
     base_url = getattr(ctx, "canonical_url", None) or ctx.target_url
 
     if not ctx.js_files:
@@ -189,13 +240,15 @@ def run(ctx: Context, phase_num=5, total=9) -> Context:
         ctx.log_phase_done(phase_num, total, "js_extract", "0 JS files")
         return ctx
 
-    ctx.log(f"[js_extract] Processing {len(ctx.js_files)} JS files "
-            f"({len(ctx.source_maps)} with source maps)...")
+    ctx.log(
+        f"[js_extract] Processing {len(ctx.js_files)} JS files "
+        f"({len(ctx.source_maps)} with source maps)..."
+    )
 
     all_results   = []
     global_params = set()
     global_ep     = set()
-    param_map     = {}   # endpoint → set of params
+    param_map     = {}
     all_secrets   = []
 
     with ThreadPoolExecutor(max_workers=20) as ex:
@@ -211,68 +264,59 @@ def run(ctx: Context, phase_num=5, total=9) -> Context:
             for js_url in ctx.js_files
         }
         done = 0
-        for f in as_completed(futures):
-            r    = f.result()
+        for fut in as_completed(futures):
+            r     = fut.result()
             done += 1
             all_results.append(r)
-
             global_params.update(r["params"])
             global_ep.update(r["endpoints"])
             all_secrets.extend(r["secrets"])
-
-            # Build param map keyed by endpoint
             for ep in r["endpoints"]:
-                if ep not in param_map:
-                    param_map[ep] = set()
-                param_map[ep].update(r["params"])
+                param_map.setdefault(ep, set()).update(r["params"])
 
             if not ctx.silent and (r["params"] or r["endpoints"]):
+                sec_lbl = f"  ★ {len(r['secrets'])} secrets" if r["secrets"] else ""
                 ctx.log(
                     f"[js_extract]   {r['source']:12}  "
                     f"{len(r['params']):3} params  "
-                    f"{len(r['endpoints']):3} endpoints  "
-                    f"{'★ ' + str(len(r['secrets'])) + ' secrets' if r['secrets'] else ''}"
+                    f"{len(r['endpoints']):3} endpoints{sec_lbl}"
                     f"  {r['url']}"
                 )
 
-    # Finalise
     ctx.js_global_params = sorted(global_params)
     ctx.js_endpoints     = sorted(global_ep)
-    ctx.js_param_map     = {ep: sorted(params) for ep, params in param_map.items()}
+    ctx.js_param_map     = {ep: sorted(p) for ep, p in param_map.items()}
     ctx.js_file_data     = all_results
 
-    # High-value param summary
     high_value = [p for p in ctx.js_global_params if p in HIGH_VALUE_PARAMS]
 
-    # Persist
     ctx.write_json("js_params.json", {
-        "total_params":    len(ctx.js_global_params),
-        "high_value":      high_value,
-        "all_params":      ctx.js_global_params,
-        "by_endpoint":     ctx.js_param_map,
+        "total_params": len(ctx.js_global_params),
+        "high_value":   high_value,
+        "all_params":   ctx.js_global_params,
+        "by_endpoint":  ctx.js_param_map,
     })
     ctx.write_json("js_endpoints.json", {
         "total":     len(ctx.js_endpoints),
         "endpoints": ctx.js_endpoints,
     })
-    ctx.write_text("js_params_flat.txt",
-                   "\n".join(ctx.js_global_params))
-    ctx.write_text("js_endpoints_flat.txt",
-                   "\n".join(ctx.js_endpoints))
+    ctx.write_text("js_params_flat.txt",    "\n".join(ctx.js_global_params))
+    ctx.write_text("js_endpoints_flat.txt", "\n".join(ctx.js_endpoints))
 
     if all_secrets:
         ctx.write_json("js_secrets_hints.json", all_secrets)
-        ctx.log(f"[js_extract] ⚠  {len(all_secrets)} potential secrets/keys found → js_secrets_hints.json")
+        ctx.log(f"[js_extract]   {len(all_secrets)} potential secrets → js_secrets_hints.json")
 
-    # Print high-value params for quick review
     if high_value and not ctx.silent:
-        ctx.log(f"[js_extract] ★ High-value params: {', '.join(high_value[:20])}")
+        ctx.log(f"[js_extract]   High-value params: {', '.join(high_value[:20])}")
 
     ctx.phases_run.append("js_extract")
-    ctx.log_phase_done(phase_num, total, "js_extract",
+    ctx.log_phase_done(
+        phase_num, total, "js_extract",
         f"{len(ctx.js_files)} JS files | "
         f"{len(ctx.js_global_params)} params | "
         f"{len(high_value)} high-value | "
         f"{len(ctx.js_endpoints)} endpoints | "
-        f"{len(all_secrets)} secret hints")
+        f"{len(all_secrets)} secret hints",
+    )
     return ctx
