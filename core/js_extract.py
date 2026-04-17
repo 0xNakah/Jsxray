@@ -22,8 +22,11 @@ FIX 5d  Correct destructuring alias parsing:
 
 FIX 6   Validate resolved endpoint URLs — drop anything whose netloc is
          empty, has no dot, or whose scheme is not http/https.
-         Prevents truncated strings like "http://www.ecma-inte" from
-         entering the probe list.
+
+FIX 7   Drop camelCase identifiers before lowercasing.
+         HTTP params are snake_case / kebab-case / lowercase — never camelCase.
+         Any token with an internal uppercase letter (e.g. appendChild,
+         getBoundingClientRect) is a JS identifier and is silently rejected.
 """
 
 import re, requests, json
@@ -69,14 +72,32 @@ NOISE_PREFIXES = (
     "ng-", "data-", "aria-", "v-", "x-", "hx-",
 )
 
-# Pattern-based noise
+# Pattern-based noise (applied post-lowercase)
 NOISE_PATTERNS = [
     re.compile(r"^on[a-z]+$"),          # onclick / onmouseover / etc.
     re.compile(r"^(?:js|css|html)$"),   # generic filetype noise
 ]
 
+# camelCase detector — applied to the ORIGINAL (pre-lowercase) token
+_CAMEL_RE = re.compile(r'[a-z][A-Z]')
+
+
+def _is_camel_case(name: str) -> bool:
+    """Return True if name contains an internal uppercase letter.
+
+    HTTP params are snake_case, kebab-case, or all-lowercase.
+    camelCase tokens (appendChild, getBoundingClientRect, addEventListener…)
+    are JS identifiers / DOM API names, never real query parameters.
+    """
+    return bool(_CAMEL_RE.search(name))
+
 
 def is_noise_param(name: str) -> bool:
+    """Return True if name should be discarded (not a real HTTP param).
+
+    Expects the name already lowercased. For camelCase detection call
+    _is_camel_case() on the original token BEFORE lowercasing.
+    """
     if not name:
         return True
     n = name.strip().lower()
@@ -171,10 +192,12 @@ def _parse_destructure(block):
             continue
         if "=" in token:
             token = token.split("=", 1)[0].strip()
-        # take LHS of colon — that is the actual param name
         if ":" in token:
             token = token.split(":", 1)[0].strip()
-        name = token.strip().strip("'\"` ; ").lower()
+        raw  = token.strip().strip("'\"` ; ")
+        if _is_camel_case(raw):          # FIX 7: drop before lowercasing
+            continue
+        name = raw.lower()
         if not is_noise_param(name):
             names.append(name)
     return names
@@ -187,7 +210,10 @@ def _parse_object_keys(block):
         token = token.strip()
         if not token or token.startswith("..."):
             continue
-        key = token.split(":", 1)[0].strip().strip("'\"` ; ").lower()
+        raw = token.split(":", 1)[0].strip().strip("'\"` ; ")
+        if _is_camel_case(raw):          # FIX 7
+            continue
+        key = raw.lower()
         if not is_noise_param(key):
             names.append(key)
     return names
@@ -231,23 +257,14 @@ def fetch_source_map(map_url, timeout, ua):
 # ── URL validation ────────────────────────────────────────────────────────────
 
 def _is_valid_endpoint(url: str) -> bool:
-    """Return True only if url has a proper scheme and a routable hostname.
-
-    Rejects:
-      - missing/empty netloc          ("http://?foo=bar")
-      - netloc with no dot            ("http://localhost", "http://www")
-      - truncated hostnames           ("http://www.ecma-inte")
-      - non-http/https schemes        ("ftp://...", "javascript:...")
-      - bare paths that slipped past  ("/api/v1" — urljoin may produce these)
-    """
+    """Return True only if url has a proper scheme and a routable hostname."""
     try:
         p = urlparse(url)
         if p.scheme not in ("http", "https"):
             return False
-        netloc = p.netloc.split(":")[0]   # strip port
+        netloc = p.netloc.split(":")[0]
         if not netloc or "." not in netloc:
             return False
-        # Require at least 2 chars after the last dot (TLD sanity check)
         tld = netloc.rsplit(".", 1)[-1]
         if len(tld) < 2:
             return False
@@ -274,7 +291,10 @@ def extract_params(text):
 
     for pattern in PARAM_SINGLE:
         for m in pattern.finditer(text):
-            name = m.group(1).strip().lower()
+            raw  = m.group(1).strip()
+            if _is_camel_case(raw):      # FIX 7: reject before lowercasing
+                continue
+            name = raw.lower()
             if not is_noise_param(name):
                 params.add(name)
 
