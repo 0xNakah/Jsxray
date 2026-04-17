@@ -19,10 +19,15 @@ FIX 5c  Drop common UI/CSS-ish names that create false positives:
          form-group, dropdown-item, tooltip, field-name
 FIX 5d  Correct destructuring alias parsing:
          const { search: alias } = query  → extract "search", not "alias"
+
+FIX 6   Validate resolved endpoint URLs — drop anything whose netloc is
+         empty, has no dot, or whose scheme is not http/https.
+         Prevents truncated strings like "http://www.ecma-inte" from
+         entering the probe list.
 """
 
 import re, requests, json
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from core.context import Context
 
@@ -92,12 +97,12 @@ def is_noise_param(name: str) -> bool:
 ENDPOINT_PATTERNS = [
     re.compile(
         r"""(?:fetch|axios(?:\.\w+)?|http\.(?:get|post|put|delete|patch))\s*"""
-        r"""\(\s*['"` + "`" + r"]([^'\"` + "`" + r"\s]{3,}(?:/[^'\"` + "`" + r"\s]*)?)['\"` + "`" + r"]"""
+        r"""\(\s*['"` + "`" + r"]([^'"` + "`" + r"\s]{3,}(?:/[^'"` + "`" + r"\s]*)?)['\"` + "`" + r"]"""
     ),
-    re.compile(r"""['"` + "`" + r"](/(?:api|v\d+|rest|graphql|ajax|service|data|endpoint|query)[^'\"` + "`" + r"\s]{0,100})['\"` + "`" + r"]"""),
-    re.compile(r"""['"` + "`" + r"](/[a-zA-Z0-9_\-./]{3,80}\?[a-zA-Z0-9_\-=&%+.]{2,100})['\"` + "`" + r"]"""),
-    re.compile(r"""['"` + "`" + r"](https?://[^'\"` + "`" + r"\s]{10,200})['\"` + "`" + r"]"""),
-    re.compile(r"""(?:path|route|url|href|src|action)\s*[:=]\s*['\"` + "`" + r"](/[^'\"` + "`" + r"\s]{2,80})['\"` + "`" + r"]"""),
+    re.compile(r"""['"` + "`" + r"](/(?:api|v\d+|rest|graphql|ajax|service|data|endpoint|query)[^'"` + "`" + r"\s]{0,100})['"` + "`" + r"]"""),
+    re.compile(r"""['"` + "`" + r"](/[a-zA-Z0-9_\-./]{3,80}\?[a-zA-Z0-9_\-=&%+.]{2,100})['"` + "`" + r"]"""),
+    re.compile(r"""['"` + "`" + r"](https?://[^'"` + "`" + r"\s]{10,200})['"` + "`" + r"]"""),
+    re.compile(r"""(?:path|route|url|href|src|action)\s*[:=]\s*['"` + "`" + r"](/[^'"` + "`" + r"\s]{2,80})['"` + "`" + r"]"""),
 ]
 
 # ── Single-name parameter patterns ───────────────────────────────────────────
@@ -223,6 +228,34 @@ def fetch_source_map(map_url, timeout, ua):
     return ""
 
 
+# ── URL validation ────────────────────────────────────────────────────────────
+
+def _is_valid_endpoint(url: str) -> bool:
+    """Return True only if url has a proper scheme and a routable hostname.
+
+    Rejects:
+      - missing/empty netloc          ("http://?foo=bar")
+      - netloc with no dot            ("http://localhost", "http://www")
+      - truncated hostnames           ("http://www.ecma-inte")
+      - non-http/https schemes        ("ftp://...", "javascript:...")
+      - bare paths that slipped past  ("/api/v1" — urljoin may produce these)
+    """
+    try:
+        p = urlparse(url)
+        if p.scheme not in ("http", "https"):
+            return False
+        netloc = p.netloc.split(":")[0]   # strip port
+        if not netloc or "." not in netloc:
+            return False
+        # Require at least 2 chars after the last dot (TLD sanity check)
+        tld = netloc.rsplit(".", 1)[-1]
+        if len(tld) < 2:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 # ── Core extraction ───────────────────────────────────────────────────────────
 
 def extract_endpoints(text, base_url):
@@ -230,7 +263,9 @@ def extract_endpoints(text, base_url):
     for pattern in ENDPOINT_PATTERNS:
         for m in pattern.finditer(text):
             ep = m.group(1).strip()
-            endpoints.add(ep if ep.startswith("http") else urljoin(base_url, ep))
+            resolved = ep if ep.startswith("http") else urljoin(base_url, ep)
+            if _is_valid_endpoint(resolved):
+                endpoints.add(resolved)
     return list(endpoints)
 
 
