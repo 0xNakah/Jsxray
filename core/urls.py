@@ -25,6 +25,23 @@ SKIP_STRINGS = [
     "node_modules", "/__hmr",
 ]
 
+# Phrases that indicate a WAF/bot-block page
+_BLOCK_PHRASES = [
+    "access denied", "403 forbidden", "blocked",
+    "captcha", "are you a human", "security check",
+    "ray id", "cloudflare", "bot protection",
+    "ddos protection", "please enable javascript",
+    "just a moment", "verifying you are human",
+]
+
+
+def is_blocked(html: str, status_code) -> bool:
+    """Return True if the response looks like a WAF/bot-block page."""
+    if status_code == 403:
+        return True
+    text = html.lower()
+    return any(phrase in text for phrase in _BLOCK_PHRASES)
+
 
 def _dedup(lst):
     seen, out = set(), []
