@@ -135,6 +135,12 @@ def is_noise_param(name: str) -> bool:
     return False
 
 
+def _host_in_scope(host: str, domain: str) -> bool:
+    host = (host or "").lower().lstrip("www.")
+    base = (domain or "").lower().lstrip("www.")
+    return bool(host) and bool(base) and (host == base or host.endswith("." + base))
+
+
 # ── Endpoint patterns ─────────────────────────────────────────────────────────
 ENDPOINT_PATTERNS = [
     re.compile(
@@ -408,15 +414,23 @@ def _is_valid_endpoint(url: str) -> bool:
         return False
 
 
+def _is_in_scope_endpoint(url: str, domain: str) -> bool:
+    try:
+        host = urlparse(url).netloc
+        return _host_in_scope(host, domain)
+    except Exception:
+        return False
+
+
 # ── Core extraction ───────────────────────────────────────────────────────────
 
-def extract_endpoints(text, base_url):
+def extract_endpoints(text, base_url, domain):
     endpoints = set()
     for pattern in ENDPOINT_PATTERNS:
         for m in pattern.finditer(text):
             ep = m.group(1).strip()
             resolved = ep if ep.startswith("http") else urljoin(base_url, ep)
-            if _is_valid_endpoint(resolved):
+            if _is_valid_endpoint(resolved) and _is_in_scope_endpoint(resolved, domain):
                 endpoints.add(resolved)
     return list(endpoints)
 
@@ -465,7 +479,7 @@ def extract_secrets(text, js_url):
     return secrets
 
 
-def process_js_file(js_url, map_url, base_url, timeout, ua):
+def process_js_file(js_url, map_url, base_url, domain, timeout, ua):
     result = {
         "url": js_url,
         "map_url": map_url,
@@ -487,7 +501,7 @@ def process_js_file(js_url, map_url, base_url, timeout, ua):
     if not text:
         return result
 
-    result["endpoints"] = extract_endpoints(text, base_url)
+    result["endpoints"] = extract_endpoints(text, base_url, domain)
     result["params"]    = extract_params(text)
     result["secrets"]   = extract_secrets(text, js_url)
     return result
@@ -497,6 +511,7 @@ def process_js_file(js_url, map_url, base_url, timeout, ua):
 
 def run(ctx, phase_num=5, total=9):
     base_url = getattr(ctx, "canonical_url", None) or ctx.target_url
+    domain   = urlparse(base_url).netloc.lstrip("www.")
 
     if not ctx.js_files:
         ctx.log("[js_extract] No JS files to process — skipping")
@@ -522,6 +537,7 @@ def run(ctx, phase_num=5, total=9):
                 js_url,
                 ctx.source_maps.get(js_url),
                 base_url,
+                domain,
                 ctx.timeout,
                 ctx.user_agent,
             ): js_url
