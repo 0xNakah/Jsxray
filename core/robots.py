@@ -108,12 +108,11 @@ def probe_path(base_url: str, path: str, timeout: int, ua: str,
                     result["note"]        = "JS endpoint"
         elif r.status_code == 403:
             result["interesting"] = True
-            result["note"]        = "403 — try bypass"
+            result["note"]        = "403 — try bypass / param discovery"
         elif r.status_code == 401:
             result["interesting"] = True
-            result["note"]        = "401 — auth required"
+            result["note"]        = "401 — auth required / param discovery"
         elif r.status_code in (301, 302, 303, 307, 308):
-            # Final hop is still a redirect (external, etc.)
             result["redirect_to"] = r.headers.get("Location", "")
             result["note"]        = f"redirect → {result['redirect_to']}"
     except requests.exceptions.Timeout:
@@ -156,19 +155,16 @@ def run(ctx: Context, phase_num=2, total=9) -> Context:
                 print(f"[robots] {flag} {str(r['status']):>5}  "
                       f"{r['path']:<50}  {r['note']}")
 
-    # Sort: high-value + interesting first
     results.sort(key=lambda x: (not x.get("high_value"), not x["interesting"],
                                  str(x["status"])))
     ctx.robots_live = results
 
-    # Feed live HTML pages into url_pool using resolved_url
     for r in results:
-        if r["status"] == 200:
+        if r["status"] in (200, 401, 403):
             live_url = r.get("resolved_url") or r["url"]
             if live_url not in ctx.url_pool:
                 ctx.url_pool.append(live_url)
 
-    # Write condensed JSON — only interesting entries to keep file small
     interesting = [r for r in results if r["interesting"]]
     ctx.write_json("robots_paths.json", {
         "total":       len(paths),
