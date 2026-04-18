@@ -16,31 +16,25 @@ DEFAULT_CONFIG = {
         "user_agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     },
     "tools": {
-        "katana":         "katana",
-        "subfinder":      "subfinder",
-        "gau":            "gau",
-        "waybackurls":    "waybackurls",
-        "waymore":        "waymore",
-        "httpx":          "httpx",
-        "x8":             "x8",
-        "arjun":          "arjun",
-        "uro":            "uro",
-        "xnLinkFinder":   "xnLinkFinder",
+        "katana":       "katana",
+        "subfinder":    "subfinder",
+        "amass":        "amass",
+        "gau":          "gau",
+        "waybackurls":  "waybackurls",
+        "waymore":      "waymore",
+        "httpx":        "httpx",
+        "x8":           "x8",
+        "arjun":        "arjun",
+        "uro":          "uro",
+        "xnLinkFinder": "xnLinkFinder",
     },
     "mode": {
         # quick: no external tools — robots → JS → params. Fast.
-        "quick":    {"phases": ["intake","robots","js_discovery","js_extract","output"]},
+        "quick":    {"phases": ["intake", "robots", "js_discovery", "js_extract", "output"]},
         # standard: passive harvest + deep + active crawl
-        "standard": {"phases": ["intake","robots","urls","js_discovery","js_extract","deep","crawl","output"]},
+        "standard": {"phases": ["intake", "robots", "urls", "js_discovery", "js_extract", "deep", "crawl", "output"]},
         # full: subdomains + everything
-        "full":     {"phases": ["intake","subdomains","robots","urls","js_discovery","js_extract","deep","crawl","output"]},
-        # watch: standard + monitor diff
-        "watch":    {"phases": ["intake","robots","urls","js_discovery","js_extract","deep","crawl","output","monitor"]},
-    },
-    "alerts": {
-        "discord_webhook":  "",
-        "telegram_token":   "",
-        "telegram_chat_id": "",
+        "full":     {"phases": ["intake", "subdomains", "robots", "urls", "js_discovery", "js_extract", "deep", "crawl", "output"]},
     },
 }
 
