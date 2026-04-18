@@ -27,6 +27,14 @@ FIX 7   Drop camelCase identifiers before lowercasing.
          HTTP params are snake_case / kebab-case / lowercase — never camelCase.
          Any token with an internal uppercase letter (e.g. appendChild,
          getBoundingClientRect) is a JS identifier and is silently rejected.
+         Also catches uppercase-prefix mixed case (XMLData, HTMLContent).
+
+FIX 8   fetch_source_map now also extracts route hints from the `sources`
+         array when sourcesContent is empty or unavailable.
+
+FIX 9   extract_params no longer double-passes PARAM_BLOCK entries.
+         Destructuring patterns use _parse_destructure only;
+         object-literal patterns use _parse_object_keys only.
 """
 
 import re, requests, json
@@ -78,16 +86,29 @@ NOISE_PATTERNS = [
     re.compile(r"^(?:js|css|html)$"),   # generic filetype noise
 ]
 
-# camelCase detector — applied to the ORIGINAL (pre-lowercase) token
-_CAMEL_RE = re.compile(r'[a-z][A-Z]')
+# FIX 7 (extended): catches both standard camelCase (userId) and
+# uppercase-prefix mixed case (XMLData, HTMLContent, getBoundingClientRect).
+# Rules:
+#   - standard camelCase:  lowercase letter followed by uppercase  → [a-z][A-Z]
+#   - PascalCase / mixed:  uppercase letter followed by lowercase  → [A-Z][a-z]
+#     (this catches XMLData: 'L'→'D' is [A-Z][a-z], and getBoundingClientRect)
+# All-caps acronyms used as real params (ID, URL, OK, API) are fully uppercase
+# and contain no [a-z][A-Z] or [A-Z][a-z] transitions, so they pass through.
+_CAMEL_RE = re.compile(r'[a-z][A-Z]|[A-Z][a-z]')
 
 
 def _is_camel_case(name: str) -> bool:
-    """Return True if name contains an internal uppercase letter.
+    """Return True if name looks like a JS identifier rather than an HTTP param.
 
-    HTTP params are snake_case, kebab-case, or all-lowercase.
-    camelCase tokens (appendChild, getBoundingClientRect, addEventListener…)
-    are JS identifiers / DOM API names, never real query parameters.
+    Rejects:
+      - standard camelCase:           userId, addEventListener
+      - uppercase-prefix mixed case:  XMLData, HTMLContent, getBoundingClientRect
+
+    Passes through:
+      - all-lowercase:  search, page, sort
+      - snake_case:     redirect_uri, user_id
+      - kebab-case:     redirect-uri
+      - all-caps:       ID, URL, API, OK  (real params exist in all-caps)
     """
     return bool(_CAMEL_RE.search(name))
 
@@ -156,12 +177,25 @@ PARAM_SINGLE = [
 ]
 
 # ── Block patterns (destructuring / object literals) ─────────────────────────
-PARAM_BLOCK = [
+# FIX 9: Each entry is a (pattern, parser) tuple so extract_params knows
+# exactly which parser to apply — no more double-passing the same block.
+#
+# Destructuring patterns  → _parse_destructure
+#   Handles: const { q, page, sort='asc', search: alias } = params
+#   Takes LHS of colon, so { search: localVar } → 'search', not 'localVar'.
+#
+# Object-literal patterns → _parse_object_keys
+#   Handles: { q, page: val, sort: fn() }  (keys only, not values)
+
+PARAM_BLOCK_DESTRUCTURE = [
     # const { q, page, sort } = params / query / req.query / req.body
     re.compile(
         r"""(?:const|let|var)\s*\{([^}]{1,300})\}\s*=\s*"""
         r"""(?:params|query|searchParams|req\.query|req\.body|qs|body|payload)"""
     ),
+]
+
+PARAM_BLOCK_OBJECT = [
     # axios({ params: { q, page } })
     re.compile(r"""params\s*:\s*\{([^}]{1,300})\}"""),
     # fetch body  JSON.stringify({ q, page, sort })
@@ -195,7 +229,7 @@ def _parse_destructure(block):
         if ":" in token:
             token = token.split(":", 1)[0].strip()
         raw  = token.strip().strip("'\"` ; ")
-        if _is_camel_case(raw):          # FIX 7: drop before lowercasing
+        if _is_camel_case(raw):
             continue
         name = raw.lower()
         if not is_noise_param(name):
@@ -211,7 +245,7 @@ def _parse_object_keys(block):
         if not token or token.startswith("..."):
             continue
         raw = token.split(":", 1)[0].strip().strip("'\"` ; ")
-        if _is_camel_case(raw):          # FIX 7
+        if _is_camel_case(raw):
             continue
         key = raw.lower()
         if not is_noise_param(key):
@@ -236,7 +270,52 @@ def fetch_js(url, timeout, ua):
     return ""
 
 
+# FIX 8: When sourcesContent is absent or empty, fall back to extracting
+# route-hint paths from the `sources` array and injecting them as synthetic
+# endpoint candidates into the returned text so extract_endpoints() can pick
+# them up in the normal flow.
+_SOURCE_PATH_NOISE = re.compile(
+    r"(?:node_modules|webpack/runtime|__webpack|\.(test|spec|stories|d\.ts))",
+    re.IGNORECASE,
+)
+
+def _sources_to_hint_text(sources: list) -> str:
+    """Convert source map `sources` file paths to a synthetic JS snippet.
+
+    Paths like '../src/api/users.js' are emitted as:
+        path: "/api/users"
+    so that ENDPOINT_PATTERNS pick them up naturally.
+    """
+    lines = []
+    for src in sources:
+        if not src or not isinstance(src, str):
+            continue
+        if _SOURCE_PATH_NOISE.search(src):
+            continue
+        # Normalise: strip webpack:// prefix, query strings, hash
+        clean = re.sub(r'^webpack:/+[^/]*', '', src)
+        clean = re.sub(r'[?#].*$', '', clean)
+        clean = re.sub(r'\.(?:js|ts|jsx|tsx|vue|svelte)$', '', clean, flags=re.IGNORECASE)
+        # Keep only path-like segments (at least one slash and alpha char)
+        if '/' not in clean:
+            continue
+        # Collapse relative dots: strip leading ./ or ../
+        clean = re.sub(r'^(?:\.\./)+', '/', clean)
+        clean = re.sub(r'^\.',  '/', clean)
+        if not clean.startswith('/'):
+            clean = '/' + clean
+        lines.append(f'path: "{clean}"')
+    return '\n'.join(lines)
+
+
 def fetch_source_map(map_url, timeout, ua):
+    """Fetch and decode a source map.
+
+    Priority:
+      1. sourcesContent  — inlined original source (best signal)
+      2. sources paths   — file path hints → synthetic endpoint text (FIX 8)
+      3. raw map text    — fallback
+    """
     try:
         r = requests.get(
             map_url,
@@ -244,11 +323,25 @@ def fetch_source_map(map_url, timeout, ua):
             headers={**HEADERS, "User-Agent": ua},
             allow_redirects=True,
         )
-        if r.status_code == 200:
-            data = r.json()
-            sources = data.get("sourcesContent", [])
-            combined = "\n\n".join(s for s in sources if s and isinstance(s, str))
-            return combined if combined else r.text
+        if r.status_code != 200:
+            return ""
+        data = r.json()
+
+        # 1. Prefer inlined source content
+        sources_content = data.get("sourcesContent", [])
+        combined = "\n\n".join(s for s in sources_content if s and isinstance(s, str))
+        if combined:
+            return combined
+
+        # 2. FIX 8: fall back to path hints from `sources` array
+        sources = data.get("sources", [])
+        hint_text = _sources_to_hint_text(sources)
+        if hint_text:
+            return hint_text
+
+        # 3. Raw map text as last resort
+        return r.text
+
     except Exception:
         pass
     return ""
@@ -289,21 +382,26 @@ def extract_endpoints(text, base_url):
 def extract_params(text):
     params = set()
 
+    # Single-token patterns
     for pattern in PARAM_SINGLE:
         for m in pattern.finditer(text):
             raw  = m.group(1).strip()
-            if _is_camel_case(raw):      # FIX 7: reject before lowercasing
+            if _is_camel_case(raw):
                 continue
             name = raw.lower()
             if not is_noise_param(name):
                 params.add(name)
 
-    for pattern in PARAM_BLOCK:
+    # FIX 9: destructuring patterns — parse as destructure only
+    for pattern in PARAM_BLOCK_DESTRUCTURE:
         for m in pattern.finditer(text):
-            block = m.group(1)
-            for name in _parse_destructure(block):
+            for name in _parse_destructure(m.group(1)):
                 params.add(name)
-            for name in _parse_object_keys(block):
+
+    # FIX 9: object-literal patterns — parse as object keys only
+    for pattern in PARAM_BLOCK_OBJECT:
+        for m in pattern.finditer(text):
+            for name in _parse_object_keys(m.group(1)):
                 params.add(name)
 
     return sorted(params)
