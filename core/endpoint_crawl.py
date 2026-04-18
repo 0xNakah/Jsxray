@@ -19,7 +19,7 @@ Strategy
               • <input name>, <select name>, <textarea name>   → params
               • <a href="?foo=bar">                            → params (query keys)
               • <form action="/path">                          → endpoints
-              • <script src="/js/app.js">                      → new JS URLs → ctx.js_files_extra
+              • <script src="/js/app.js">                      → new JS URLs → extra_js pass
               • inline <script> text                           → extract_endpoints + extract_params
       JSON  → walk all keys recursively                        → params
               walk all string values that look like paths/URLs → endpoints
@@ -28,11 +28,17 @@ Strategy
 4.  All newly found endpoints are filtered through _is_in_scope_endpoint.
     All newly found params are filtered through is_noise_param.
 
-5.  Merge results into ctx:
+5.  Extra JS pass (FIX):
+      Any <script src> URLs discovered in HTML responses are run through
+      process_js_file (same pipeline as js_extract phase) so their params,
+      endpoints, lazy chunks and secrets are fully extracted and merged.
+
+6.  Merge results into ctx:
       ctx.js_endpoints    += new endpoints  (deduped)
       ctx.js_global_params+= new params     (deduped)
+      ctx.js_files        += new JS URLs    (deduped)
 
-6.  Write outputs:
+7.  Write outputs:
       crawl_endpoints.json   { total, by_url: {url: [endpoints]} }
       crawl_params.json      { total, by_url: {url: [params]} }
       crawl_endpoints_flat.txt
@@ -51,6 +57,7 @@ from core.js_extract import (
     is_noise_param,
     _is_in_scope_endpoint,
     _host_in_scope,
+    process_js_file,
     HEADERS,
 )
 
@@ -132,7 +139,7 @@ def _extract_html(text, page_url, domain):
         if _is_in_scope_endpoint(resolved, domain):
             endpoints.add(resolved)
 
-    # External script srcs → candidate JS files
+    # External script srcs → candidate JS files for extra pass
     for m in _SCRIPT_SRC.finditer(text):
         src = m.group(1).strip()
         if "${" in src:
@@ -268,7 +275,7 @@ def run(ctx, phase_num=6, total=9):
                     f"  {r['url']}"
                 )
 
-    # ── Merge ────────────────────────────────────────────────────────────────
+    # ── Collect results ───────────────────────────────────────────────────────
     new_params    = set()
     new_endpoints = set()
     extra_js      = set()
@@ -286,6 +293,56 @@ def run(ctx, phase_num=6, total=9):
         if r["extra_js"]:
             extra_js.update(r["extra_js"])
 
+    # ── FIX: Process extra JS files through full js_extract pipeline ──────────
+    existing_js   = set(getattr(ctx, "js_files", []))
+    new_js_files  = sorted(extra_js - existing_js - seen)
+    extra_js_params_count = 0
+
+    if new_js_files:
+        ctx.log(f"[endpoint_crawl] Processing {len(new_js_files)} newly discovered JS files...")
+
+        js_file_data = getattr(ctx, "js_file_data", [])
+
+        with ThreadPoolExecutor(max_workers=15) as ex:
+            futures = {
+                ex.submit(
+                    process_js_file,
+                    js_url,
+                    None,           # no source map hint at this stage
+                    base_url,
+                    domain,
+                    crawl_timeout,
+                    ctx.user_agent,
+                ): js_url
+                for js_url in new_js_files
+            }
+            for fut in as_completed(futures):
+                r = fut.result()
+                js_file_data.append(r)
+
+                new_params.update(r["params"])
+                new_endpoints.update(r["endpoints"])
+                extra_js_params_count += len(r["params"])
+
+                # Surface any secrets found
+                if r.get("secrets"):
+                    existing_secrets = getattr(ctx, "js_file_data", [])
+                    ctx.log(
+                        f"[endpoint_crawl]   ★ {len(r['secrets'])} secrets in {r['url']}"
+                    )
+
+                if not ctx.silent and (r["params"] or r["endpoints"]):
+                    ctx.log(
+                        f"[endpoint_crawl]   [extra-js]  "
+                        f"{len(r['params']):3} params  "
+                        f"{len(r['endpoints']):3} endpoints  "
+                        f"{r['url']}"
+                    )
+
+        ctx.js_file_data = js_file_data
+        ctx.js_files     = sorted(existing_js | set(new_js_files))
+
+    # ── Merge into ctx ────────────────────────────────────────────────────────
     existing_eps    = set(getattr(ctx, "js_endpoints", []))
     existing_params = set(getattr(ctx, "js_global_params", []))
 
@@ -294,14 +351,9 @@ def run(ctx, phase_num=6, total=9):
 
     ctx.js_endpoints     = sorted(existing_eps    | new_endpoints)
     ctx.js_global_params = sorted(existing_params | new_params)
+    ctx.js_files_extra   = new_js_files
 
-    # Surface any extra JS files found during HTML crawl
-    if extra_js:
-        ctx.js_files_extra = sorted(extra_js - set(getattr(ctx, "js_files", [])))
-    else:
-        ctx.js_files_extra = []
-
-    # ── Write outputs ────────────────────────────────────────────────────────
+    # ── Write outputs ─────────────────────────────────────────────────────────
     ctx.write_json("crawl_endpoints.json", {
         "total_new":   len(added_eps),
         "total_seen":  len(new_endpoints),
@@ -316,6 +368,8 @@ def run(ctx, phase_num=6, total=9):
         ctx.write_text("crawl_endpoints_flat.txt", "\n".join(sorted(added_eps)))
     if added_params:
         ctx.write_text("crawl_params_flat.txt", "\n".join(sorted(added_params)))
+    if new_js_files:
+        ctx.write_text("crawl_extra_js.txt", "\n".join(new_js_files))
 
     ctx.phases_run.append("endpoint_crawl")
     ctx.log_phase_done(
@@ -323,6 +377,7 @@ def run(ctx, phase_num=6, total=9):
         f"{len(candidates)} URLs crawled | "
         f"+{len(added_eps)} endpoints | "
         f"+{len(added_params)} params | "
-        f"{len(extra_js)} extra JS files found",
+        f"{len(new_js_files)} extra JS files processed "
+        f"(+{extra_js_params_count} params from JS)",
     )
     return ctx
