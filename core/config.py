@@ -29,12 +29,12 @@ DEFAULT_CONFIG = {
         "xnLinkFinder": "xnLinkFinder",
     },
     "mode": {
-        # quick: no external tools — robots → JS → params. Fast.
-        "quick":    {"phases": ["intake", "robots", "js_discovery", "js_extract", "output"]},
-        # standard: passive harvest + deep + active crawl
-        "standard": {"phases": ["intake", "robots", "urls", "js_discovery", "js_extract", "deep", "crawl", "output"]},
+        # quick: no external tools — robots → JS → params → endpoint crawl. Fast.
+        "quick":    {"phases": ["intake", "robots", "js_discovery", "js_extract", "endpoint_crawl", "output"]},
+        # standard: passive harvest + endpoint crawl + deep + active crawl
+        "standard": {"phases": ["intake", "robots", "urls", "js_discovery", "js_extract", "endpoint_crawl", "deep", "crawl", "output"]},
         # full: subdomains + everything
-        "full":     {"phases": ["intake", "subdomains", "robots", "urls", "js_discovery", "js_extract", "deep", "crawl", "output"]},
+        "full":     {"phases": ["intake", "subdomains", "robots", "urls", "js_discovery", "js_extract", "endpoint_crawl", "deep", "crawl", "output"]},
     },
 }
 
