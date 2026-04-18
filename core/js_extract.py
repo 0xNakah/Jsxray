@@ -57,6 +57,13 @@ FEATURE 3  Lazy-loaded chunk discovery.
            JS file URL, keep only in-scope URLs, then process those chunk URLs
            in one extra pass. Newly discovered chunk URLs are merged back into
            ctx.js_files so output reflects the full discovered JS set.
+
+FIX 13  Correctly resolve bare asset-like chunk refs such as
+         "static/immutable/chunks/foo.js" or "_next/static/chunks/bar.js".
+         These are root-relative in practice but lack a leading slash, so plain
+         urljoin() incorrectly appends them under the current JS directory.
+         Added _resolve_chunk_ref() to root such known asset prefixes at the
+         site origin while preserving normal ./, ../, / and absolute URL logic.
 """
 
 import re, requests, json
@@ -391,9 +398,35 @@ def _looks_like_chunk_path(path: str) -> bool:
             "/chunks/" in lp or
             lp.startswith("./") or
             lp.startswith("../") or
-            lp.startswith("/")
+            lp.startswith("/") or
+            lp.startswith("static/") or
+            lp.startswith("assets/") or
+            lp.startswith("js/") or
+            lp.startswith("chunks/") or
+            lp.startswith("_next/") or
+            lp.startswith("public/")
         )
     )
+
+
+def _resolve_chunk_ref(ref: str, current_js_url: str) -> str:
+    if ref.startswith(("http://", "https://")):
+        return ref
+
+    parsed = urlparse(current_js_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+
+    if ref.startswith("/"):
+        return origin + ref
+
+    if ref.startswith(("./", "../")):
+        return urljoin(current_js_url, ref)
+
+    rootish_prefixes = ("static/", "assets/", "js/", "chunks/", "_next/", "public/")
+    if ref.startswith(rootish_prefixes):
+        return f"{origin}/{ref}"
+
+    return urljoin(current_js_url, ref)
 
 
 # ── Core extraction ───────────────────────────────────────────────────────────
@@ -419,7 +452,7 @@ def extract_lazy_chunks(text, current_js_url, domain):
             ref = m.group(1).strip()
             if not _looks_like_chunk_path(ref):
                 continue
-            resolved = ref if ref.startswith("http") else urljoin(current_js_url, ref)
+            resolved = _resolve_chunk_ref(ref, current_js_url)
             if _is_valid_endpoint(resolved) and _is_in_scope_endpoint(resolved, domain):
                 chunks.add(resolved)
     return sorted(chunks)
