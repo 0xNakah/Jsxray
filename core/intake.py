@@ -21,11 +21,10 @@ HEADERS = {
     "Connection":      "keep-alive",
 }
 
+_BODY_LIMIT = 32 * 1024  # 32 KB is enough for fingerprinting
+
 
 def normalize_target(target: str):
-    """Return (target_url, domain).
-    Preserves www. if supplied; domain is bare (no www/scheme) for workspace naming.
-    """
     if not target.startswith("http"):
         target_url = f"https://{target}"
     else:
@@ -36,33 +35,48 @@ def normalize_target(target: str):
     return target_url, domain
 
 
-def detect_canonical(target_url: str, timeout: int, headers: dict):
-    """Follow root URL redirects to find the real canonical base.
-
-    e.g. https://tripadvisor.com  →  https://www.tripadvisor.com
-    Returns (canonical_base, canonical_netloc).
-    Falls back to the original URL on any error.
+def _fetch_root(target_url: str, timeout: int, headers: dict):
+    """
+    Fetch the root URL once with streaming enabled.
+    Returns (response, body_snippet) where body_snippet is at most _BODY_LIMIT bytes.
+    On failure returns (None, "").
     """
     try:
         r = requests.get(target_url, timeout=timeout, headers=headers,
-                         allow_redirects=True)
-        final  = r.url.rstrip("/")
+                         allow_redirects=True, stream=True)
+        body = b""
+        for chunk in r.iter_content(chunk_size=8192):
+            body += chunk
+            if len(body) >= _BODY_LIMIT:
+                break
+        r._content = body          # cache so r.text works normally
+        r.encoding = r.encoding or "utf-8"
+        return r, body.decode(r.encoding, errors="replace")
+    except Exception:
+        return None, ""
+
+
+def detect_canonical(response, target_url: str):
+    """
+    Derive the canonical base URL from the already-fetched response.
+    Falls back to target_url if response is None.
+    """
+    if response is not None:
+        final  = response.url.rstrip("/")
         parsed = urlparse(final)
         canonical_base = f"{parsed.scheme}://{parsed.netloc}"
         return canonical_base, parsed.netloc
-    except Exception:
-        parsed = urlparse(target_url)
-        return f"{parsed.scheme}://{parsed.netloc}", parsed.netloc
+    parsed = urlparse(target_url)
+    return f"{parsed.scheme}://{parsed.netloc}", parsed.netloc
 
 
 def fetch_robots(target_url: str, timeout: int, headers: dict):
-    """Try robots.txt on canonical, www, and bare domain."""
     parsed   = urlparse(target_url)
     base     = f"{parsed.scheme}://{parsed.netloc}"
     bare     = parsed.netloc.lstrip("www.")
     www_base = f"{parsed.scheme}://www.{bare}"
 
-    candidates = list(dict.fromkeys([base, www_base]))  # dedup while preserving order
+    candidates = list(dict.fromkeys([base, www_base]))
     for base_try in candidates:
         url = f"{base_try}/robots.txt"
         try:
@@ -78,7 +92,6 @@ def fetch_robots(target_url: str, timeout: int, headers: dict):
 
 
 def fetch_sitemap(target_url: str, timeout: int, headers: dict):
-    """Try sitemap.xml and sitemap_index.xml on canonical + www."""
     parsed   = urlparse(target_url)
     base     = f"{parsed.scheme}://{parsed.netloc}"
     www_base = f"{parsed.scheme}://www.{parsed.netloc.lstrip('www.')}"
@@ -99,45 +112,42 @@ def fetch_sitemap(target_url: str, timeout: int, headers: dict):
     return []
 
 
-def detect_tech_stack(target_url: str, timeout: int, headers: dict):
-    """Lightweight fingerprint of server/framework from response headers + body."""
+def detect_tech_stack(response, body: str):
+    """
+    Fingerprint from an already-fetched response + body snippet.
+    Also returns csp_missing flag separately.
+    """
     tech = []
-    try:
-        r = requests.get(target_url, timeout=timeout, headers=headers,
-                         allow_redirects=True)
-        h   = {k.lower(): v for k, v in r.headers.items()}
-        body = r.text[:8000]
+    csp_missing = True
+    if response is None:
+        return tech, csp_missing
 
-        # Server / X-Powered-By
-        for hdr in ("server", "x-powered-by", "x-generator", "x-aspnet-version"):
-            if hdr in h:
-                tech.append(h[hdr])
+    h = {k.lower(): v for k, v in response.headers.items()}
 
-        # Framework hints from body
-        hints = {
-            "React":          ["__REACT_DEVTOOLS", "data-reactroot", "data-reactid"],
-            "Next.js":        ["__NEXT_DATA__", "_next/static"],
-            "Angular":        ["ng-version", "<app-root", "ng-app"],
-            "Vue.js":         ["__vue__", "data-v-", "<div id=\"app\""],
-            "WordPress":      ["wp-content", "wp-includes"],
-            "Drupal":         ["Drupal.settings", "/sites/default/files"],
-            "Cloudflare":     ["cf-ray", "__cf_bm", "cloudflare"],
-            "GraphQL":        ["/graphql", "__typename", "operationName"],
-            "PerimeterX":     ["_pxAppId", "px.js", "PerimeterX"],
-            "Akamai":         ["akamai", "akam/"],
-        }
-        for name, sigs in hints.items():
-            if any(sig.lower() in body.lower() or sig.lower() in str(h) for sig in sigs):
-                tech.append(name)
+    for hdr in ("server", "x-powered-by", "x-generator", "x-aspnet-version"):
+        if hdr in h:
+            tech.append(h[hdr])
 
-        # CSP present?
-        if "content-security-policy" in h:
-            tech.append("CSP")
-        else:
-            tech.append("no-CSP")
-    except Exception:
-        pass
-    return list(set(tech))
+    hints = {
+        "React":      ["__REACT_DEVTOOLS", "data-reactroot", "data-reactid"],
+        "Next.js":    ["__NEXT_DATA__", "_next/static"],
+        "Angular":    ["ng-version", "<app-root", "ng-app"],
+        "Vue.js":     ["__vue__", "data-v-", "<div id=\"app\""],
+        "WordPress":  ["wp-content", "wp-includes"],
+        "Drupal":     ["Drupal.settings", "/sites/default/files"],
+        "Cloudflare": ["cf-ray", "__cf_bm", "cloudflare"],
+        "GraphQL":    ["/graphql", "__typename", "operationName"],
+        "PerimeterX": ["_pxAppId", "px.js", "PerimeterX"],
+        "Akamai":     ["akamai", "akam/"],
+    }
+    for name, sigs in hints.items():
+        if any(sig.lower() in body.lower() or sig.lower() in str(h) for sig in sigs):
+            tech.append(name)
+
+    if "content-security-policy" in h:
+        csp_missing = False
+
+    return list(set(tech)), csp_missing
 
 
 def run(ctx: Context, phase_num=1, total=9) -> Context:
@@ -152,8 +162,11 @@ def run(ctx: Context, phase_num=1, total=9) -> Context:
 
     headers = {**HEADERS, "User-Agent": ctx.user_agent}
 
-    # ── Canonical URL detection ───────────────────────────────────────────────
-    canonical_base, canonical_netloc = detect_canonical(ctx.target_url, ctx.timeout, headers)
+    # ── Single root fetch (reused for canonical + fingerprinting) ──────────────
+    root_response, body_snippet = _fetch_root(ctx.target_url, ctx.timeout, headers)
+
+    # ── Canonical URL ──────────────────────────────────────────────────
+    canonical_base, canonical_netloc = detect_canonical(root_response, ctx.target_url)
     if canonical_netloc != urlparse(ctx.target_url).netloc:
         ctx.log(f"[intake] Redirect    : {ctx.target_url} → {canonical_base}")
         ctx.target_url = canonical_base
@@ -163,34 +176,18 @@ def run(ctx: Context, phase_num=1, total=9) -> Context:
     ctx.log(f"[intake] Domain     : {ctx.target}")
     ctx.log(f"[intake] Workspace  : {ctx.workspace}")
 
-    # ── Tech stack fingerprint ────────────────────────────────────────────────
-    tech = detect_tech_stack(ctx.target_url, ctx.timeout, headers)
+    # ── Tech stack (no extra HTTP request) ─────────────────────────────
+    tech, csp_missing = detect_tech_stack(root_response, body_snippet)
     if tech:
         ctx.tech_stack = tech
         ctx.log(f"[intake] Tech stack : {', '.join(tech)}")
+    ctx.csp_missing = csp_missing
+    if csp_missing:
+        ctx.log("[intake] CSP        : missing")
 
-    # ── robots.txt ───────────────────────────────────────────────────────────
+    # ── robots.txt ────────────────────────────────────────────────────────────
     raw, robots_url = fetch_robots(ctx.target_url, ctx.timeout, headers)
     if raw:
         ctx.robots_raw = raw
         ctx.write_text("robots_raw.txt", raw)
-        ctx.log(f"[intake] robots.txt  : {len(raw)} bytes  ({robots_url})")
-    else:
-        ctx.log(f"[intake] robots.txt  : not found")
-
-    # ── sitemap.xml ──────────────────────────────────────────────────────────
-    sitemap_urls = fetch_sitemap(ctx.target_url, ctx.timeout, headers)
-    if sitemap_urls:
-        ctx.sitemap_urls = sitemap_urls
-        ctx.url_pool.extend(sitemap_urls)
-        ctx.log(f"[intake] sitemap.xml : {len(sitemap_urls)} URLs")
-    else:
-        ctx.log(f"[intake] sitemap.xml : not found")
-
-    ctx.phases_run.append("intake")
-    ctx.log_phase_done(phase_num, total, "intake",
-        f"canonical={ctx.canonical_url} | "
-        f"robots={'yes' if ctx.robots_raw else 'no'} | "
-        f"sitemap={len(ctx.sitemap_urls)} URLs | "
-        f"tech=[{', '.join(tech[:4]) if tech else 'unknown'}]")
-    return ctx
+        ctx.log(
