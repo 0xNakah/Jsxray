@@ -68,8 +68,10 @@ JS_EXT_RE = re.compile(r'\.js(\?[^#]*)?$', re.IGNORECASE)
 _MAP_VALID_CT = ("application/json", "text/plain", "application/octet-stream",
                  "application/javascript", "text/javascript")
 
-# Minimum inline block size worth processing (skip tiny tracking pixels etc.)
-_INLINE_MIN_CHARS = 40
+# Minimum inline block size worth processing.
+# 40 was too aggressive — short but valid calls like fetch("/api/x?q=1") are 38 chars.
+# 20 filters truly empty/whitespace-only blocks while keeping all real JS.
+_INLINE_MIN_CHARS = 20
 
 
 def _resolve(ref, base_url):
