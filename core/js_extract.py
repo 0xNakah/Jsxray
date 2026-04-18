@@ -35,6 +35,10 @@ FIX 8   fetch_source_map now also extracts route hints from the `sources`
 FIX 9   extract_params no longer double-passes PARAM_BLOCK entries.
          Destructuring patterns use _parse_destructure only;
          object-literal patterns use _parse_object_keys only.
+
+FIX 10  extract_endpoints drops resolved URLs that still contain ${ —
+         these are JS template literals (e.g. `${this.host}/api/`) and
+         are unresolvable junk that pollutes the endpoint list.
 """
 
 import re, requests, json
@@ -85,39 +89,14 @@ NOISE_PATTERNS = [
     re.compile(r"^(?:js|css|html)$"),   # generic filetype noise
 ]
 
-# FIX 7 (extended): catches both standard camelCase (userId) and
-# uppercase-prefix mixed case (XMLData, HTMLContent, getBoundingClientRect).
-# Rules:
-#   - standard camelCase:  lowercase letter followed by uppercase  → [a-z][A-Z]
-#   - PascalCase / mixed:  uppercase letter followed by lowercase  → [A-Z][a-z]
-#     (this catches XMLData: 'L'→'D' is [A-Z][a-z], and getBoundingClientRect)
-# All-caps acronyms used as real params (ID, URL, OK, API) are fully uppercase
-# and contain no [a-z][A-Z] or [A-Z][a-z] transitions, so they pass through.
 _CAMEL_RE = re.compile(r'[a-z][A-Z]|[A-Z][a-z]')
 
 
 def _is_camel_case(name: str) -> bool:
-    """Return True if name looks like a JS identifier rather than an HTTP param.
-
-    Rejects:
-      - standard camelCase:           userId, addEventListener
-      - uppercase-prefix mixed case:  XMLData, HTMLContent, getBoundingClientRect
-
-    Passes through:
-      - all-lowercase:  search, page, sort
-      - snake_case:     redirect_uri, user_id
-      - kebab-case:     redirect-uri
-      - all-caps:       ID, URL, API, OK  (real params exist in all-caps)
-    """
     return bool(_CAMEL_RE.search(name))
 
 
 def is_noise_param(name: str) -> bool:
-    """Return True if name should be discarded (not a real HTTP param).
-
-    Expects the name already lowercased. For camelCase detection call
-    _is_camel_case() on the original token BEFORE lowercasing.
-    """
     if not name:
         return True
     n = name.strip().lower()
@@ -144,56 +123,37 @@ def _host_in_scope(host: str, domain: str) -> bool:
 ENDPOINT_PATTERNS = [
     re.compile(
         r"""(?:fetch|axios(?:\.\w+)?|http\.(?:get|post|put|delete|patch))\s*"""
-        r"""\(\s*['"`]([^'"`\s]{3,}(?:/[^'"`\s]*)?)['"`]"""
+        r"""\(\s*['\"`]([^'\"`\s]{3,}(?:/[^'\"`\s]*)?)['\"`]"""
     ),
-    re.compile(r"""['"`](/(?:api|v\d+|rest|graphql|ajax|service|data|endpoint|query)[^'"`\s]{0,100})['"`]"""),
-    re.compile(r"""['"`](/[a-zA-Z0-9_\-./]{3,80}\?[a-zA-Z0-9_\-=&%+.]{2,100})['"`]"""),
-    re.compile(r"""['"`](https?://[^'"`\s]{10,200})['"`]"""),
-    re.compile(r"""(?:path|route|url|href|src|action)\s*[:=]\s*['"`](/[^'"`\s]{2,80})['"`]"""),
+    re.compile(r"""['\"`](/(?:api|v\d+|rest|graphql|ajax|service|data|endpoint|query)[^'\"`\s]{0,100})['\"`]"""),
+    re.compile(r"""['\"`](/[a-zA-Z0-9_\-./]{3,80}\?[a-zA-Z0-9_\-=&%+.]{2,100})['\"`]"""),
+    re.compile(r"""['\"`](https?://[^'\"`\s]{10,200})['\"`]"""),
+    re.compile(r"""(?:path|route|url|href|src|action)\s*[:=]\s*['\"`](/[^'\"`\s]{2,80})['\"`]"""),
 ]
 
 # ── Single-name parameter patterns ───────────────────────────────────────────
 PARAM_SINGLE = [
-    # URLSearchParams .get / .set / .append / .has
     re.compile(
         r"""(?:searchParams|URLSearchParams|params)\s*"""
-        r"""\.(?:get|append|set|has)\s*\(\s*['"`]([a-zA-Z0-9_\-]{1,40})['"`]"""
+        r"""\.(?:get|append|set|has)\s*\(\s*['\"`]([a-zA-Z0-9_\-]{1,40})['\"`]"""
     ),
-    # query string  ?param=  &param=
     re.compile(r"""[?&]([a-zA-Z0-9_\-]{1,40})="""),
-    # object property access: params.foo  query["foo"]  req.query.foo
     re.compile(
-        r"""(?:params|query|qs|req\.query|args|opts)\s*[.\[]\s*['"`]?"""
-        r"""([a-zA-Z0-9_\-]{1,40})['"`]?"""
+        r"""(?:params|query|qs|req\.query|args|opts)\s*[.\[]\s*['\"`]?"""
+        r"""([a-zA-Z0-9_\-]{1,40})['\"`]?"""
     ),
-    # body / payload access — require quote or dot to avoid matching JS keywords
     re.compile(
-        r"""(?:body|payload|data|form|req\.body)\s*(?:\.\s*|\[\s*['"`])"""
+        r"""(?:body|payload|data|form|req\.body)\s*(?:\.\s*|\[\s*['\"`])"""
         r"""([a-zA-Z0-9_\-]{1,40})"""
     ),
-    # const q = params.q  (captures the var name, same as the param)
     re.compile(r"""(?:const|let|var)\s+([a-zA-Z0-9_]{1,30})\s*=\s*(?:params|query|searchParams)\s*\."""),
-    # GraphQL: $variable: String
     re.compile(r"""\$([a-zA-Z0-9_]{1,30})\s*:\s*(?:String|Int|Boolean|ID|Float)"""),
-    # FormData.append("name", ...)  fd.append('name', ...)
-    re.compile(r"""(?:formData|formdata|form|fd|new\s+FormData\s*\(\s*\))\s*\.append\s*\(\s*['"`]([a-zA-Z0-9_\-]{1,40})['"`]"""),
-    # generic .append('name', ...) chains
-    re.compile(r"""\.append\s*\(\s*['"`]([a-zA-Z0-9_\-]{1,40})['"`]"""),
+    re.compile(r"""(?:formData|formdata|form|fd|new\s+FormData\s*\(\s*\))\s*\.append\s*\(\s*['\"`]([a-zA-Z0-9_\-]{1,40})['\"`]"""),
+    re.compile(r"""\.append\s*\(\s*['\"`]([a-zA-Z0-9_\-]{1,40})['\"`]"""),
 ]
 
 # ── Block patterns (destructuring / object literals) ─────────────────────────
-# FIX 9: Each entry is a (pattern, parser) tuple so extract_params knows
-# exactly which parser to apply — no more double-passing the same block.
-#
-# Destructuring patterns  → _parse_destructure
-#   Handles: const { q, page, sort='asc', search: alias } = params
-#   Takes LHS of colon, so { search: localVar } → 'search', not 'localVar'.
-#
-# Object-literal patterns → _parse_object_keys
-#   Handles: { q, page: val, sort: fn() }  (keys only, not values)
-
 PARAM_BLOCK_DESTRUCTURE = [
-    # const { q, page, sort } = params / query / req.query / req.body
     re.compile(
         r"""(?:const|let|var)\s*\{([^}]{1,300})\}\s*=\s*"""
         r"""(?:params|query|searchParams|req\.query|req\.body|qs|body|payload)"""
@@ -201,71 +161,48 @@ PARAM_BLOCK_DESTRUCTURE = [
 ]
 
 PARAM_BLOCK_OBJECT = [
-    # axios({ params: { q, page } })
     re.compile(r"""params\s*:\s*\{([^}]{1,300})\}"""),
-    # fetch body  JSON.stringify({ q, page, sort })
     re.compile(r"""JSON\.stringify\s*\(\s*\{([^}]{1,300})\}\s*\)"""),
-    # qs.stringify({ q, page })
     re.compile(r"""qs\.stringify\s*\(\s*\{([^}]{1,300})\}\s*\)"""),
 ]
 
 # ── Secret patterns (TruffleHog-aligned) ─────────────────────────────────────
 SECRET_PATTERNS = {
-    # Cloud — AWS
     "aws_access_key":        re.compile(r"(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}"),
-    "aws_secret_key":        re.compile(r"(?i)aws.{0,20}['\"][0-9a-zA-Z/+]{40}['\"]"),
-
-    # Cloud — Azure
+    "aws_secret_key":        re.compile(r"(?i)aws.{0,20}['\""][0-9a-zA-Z/+]{40}['\"]"),
     "azure_storage_conn":    re.compile(r"DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{88}"),
     "azure_sas_token":       re.compile(r"(?i)sv=\d{4}-\d{2}-\d{2}&s[sco]=.{10,200}&sig=[A-Za-z0-9%+/=]{40,}"),
-
-    # Cloud — GCP
     "gcp_service_account":   re.compile(r'"type"\s*:\s*"service_account"'),
     "gcp_api_key":           re.compile(r"AIza[0-9A-Za-z\-_]{35}"),
-
-    # Payment & Finance
     "stripe_live_key":       re.compile(r"sk_live_[0-9a-zA-Z]{24,}"),
     "stripe_restricted_key": re.compile(r"rk_live_[0-9a-zA-Z]{24,}"),
     "paypal_braintree":      re.compile(r"access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}"),
     "square_token":          re.compile(r"sq0atp-[0-9A-Za-z\-_]{22}"),
     "square_oauth_secret":   re.compile(r"sq0csp-[0-9A-Za-z\-_]{43}"),
-
-    # Tokens & Auth
     "jwt_token":             re.compile(r"eyJ[A-Za-z0-9\-_=]+\.eyJ[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_.+/=]*"),
     "github_pat":            re.compile(r"ghp_[0-9a-zA-Z]{36}"),
     "github_oauth":          re.compile(r"gho_[0-9a-zA-Z]{36}"),
     "github_app_token":      re.compile(r"(?:ghu|ghs)_[0-9a-zA-Z]{36}"),
     "gitlab_pat":            re.compile(r"glpat-[0-9a-zA-Z\-_]{20}"),
     "npmrc_token":           re.compile(r"//registry\.npmjs\.org/:_authToken=[0-9a-zA-Z\-_]{36,}"),
-
-    # AI / LLM
     "openai_key":            re.compile(r"sk-[a-zA-Z0-9]{20}T3BlbkFJ[a-zA-Z0-9]{20}"),
     "anthropic_key":         re.compile(r"sk-ant-api\d{2}-[A-Za-z0-9\-_]{93}AA"),
-
-    # Communication
     "slack_token":           re.compile(r"xox[baprs]-[0-9a-zA-Z\-]{10,250}"),
     "slack_webhook":         re.compile(r"https://hooks\.slack\.com/services/T[a-zA-Z0-9_]{8}/B[a-zA-Z0-9_]{8,}/[a-zA-Z0-9_]{24}"),
     "twilio_account_sid":    re.compile(r"AC[a-z0-9]{32}"),
-    "twilio_auth_token":     re.compile(r"(?i)twilio.{0,20}['\"][a-f0-9]{32}['\"]"),
+    "twilio_auth_token":     re.compile(r"(?i)twilio.{0,20}['\""][a-f0-9]{32}['\"]"),
     "sendgrid_key":          re.compile(r"SG\.[a-zA-Z0-9\-_]{22}\.[a-zA-Z0-9\-_]{43}"),
     "mailchimp_key":         re.compile(r"[0-9a-f]{32}-us[0-9]{1,2}"),
-
-    # Infrastructure
     "generic_db_conn":       re.compile(r"(?i)(?:mongodb|mysql|postgres|redis|mssql)://[^:]+:[^@]+@[^\s\"']+"),
     "private_key_pem":       re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-    "heroku_api_key":        re.compile(r"(?i)[hH]eroku.{0,20}['\"][0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}['\"]"),
-
-    # Generic high-entropy fallback
-    "generic_secret":        re.compile(r"(?i)(?:secret|api_key|apikey|token|passwd|password|auth)['\"]?\s*[:=]\s*['\"]([A-Za-z0-9\-_/+]{20,})['\"]"),
+    "heroku_api_key":        re.compile(r"(?i)[hH]eroku.{0,20}['\""][0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}['\"]"),
+    "generic_secret":        re.compile(r"(?i)(?:secret|api_key|apikey|token|passwd|password|auth)['\"]?\s*[:=]\s*['\""]([A-Za-z0-9\-_/+]{20,})['\"]"),
 }
 
 
 # ── Block parsers ─────────────────────────────────────────────────────────────
 
 def _parse_destructure(block):
-    """Extract param names from { q, page, sort='asc', search: alias }.
-    Takes LHS of colon so { search: localVar } yields 'search', not 'localVar'.
-    """
     names = []
     for token in block.split(","):
         token = token.strip()
@@ -285,7 +222,6 @@ def _parse_destructure(block):
 
 
 def _parse_object_keys(block):
-    """Extract key names from { q, page: val, sort: fn() }."""
     names = []
     for token in block.split(","):
         token = token.strip()
@@ -317,38 +253,25 @@ def fetch_js(url, timeout, ua):
     return ""
 
 
-# FIX 8: When sourcesContent is absent or empty, fall back to extracting
-# route-hint paths from the `sources` array and injecting them as synthetic
-# endpoint candidates into the returned text so extract_endpoints() can pick
-# them up in the normal flow.
 _SOURCE_PATH_NOISE = re.compile(
     r"(?:node_modules|webpack/runtime|__webpack|\.(test|spec|stories|d\.ts))",
     re.IGNORECASE,
 )
 
 def _sources_to_hint_text(sources: list) -> str:
-    """Convert source map `sources` file paths to a synthetic JS snippet.
-
-    Paths like '../src/api/users.js' are emitted as:
-        path: "/api/users"
-    so that ENDPOINT_PATTERNS pick them up naturally.
-    """
     lines = []
     for src in sources:
         if not src or not isinstance(src, str):
             continue
         if _SOURCE_PATH_NOISE.search(src):
             continue
-        # Normalise: strip webpack:// prefix, query strings, hash
         clean = re.sub(r'^webpack:/+[^/]*', '', src)
         clean = re.sub(r'[?#].*$', '', clean)
         clean = re.sub(r'\.(?:js|ts|jsx|tsx|vue|svelte)$', '', clean, flags=re.IGNORECASE)
-        # Keep only path-like segments (at least one slash and alpha char)
         if '/' not in clean:
             continue
-        # Collapse relative dots: strip leading ./ or ../
-        clean = re.sub(r'^(?:\.\./)+', '/', clean)
-        clean = re.sub(r'^\.',  '/', clean)
+        clean = re.sub(r'^(?:\.\./)+'  , '/', clean)
+        clean = re.sub(r'^\.',          '/', clean)
         if not clean.startswith('/'):
             clean = '/' + clean
         lines.append(f'path: "{clean}"')
@@ -356,13 +279,6 @@ def _sources_to_hint_text(sources: list) -> str:
 
 
 def fetch_source_map(map_url, timeout, ua):
-    """Fetch and decode a source map.
-
-    Priority:
-      1. sourcesContent  — inlined original source (best signal)
-      2. sources paths   — file path hints → synthetic endpoint text (FIX 8)
-      3. raw map text    — fallback
-    """
     try:
         r = requests.get(
             map_url,
@@ -374,19 +290,16 @@ def fetch_source_map(map_url, timeout, ua):
             return ""
         data = r.json()
 
-        # 1. Prefer inlined source content
         sources_content = data.get("sourcesContent", [])
         combined = "\n\n".join(s for s in sources_content if s and isinstance(s, str))
         if combined:
             return combined
 
-        # 2. FIX 8: fall back to path hints from `sources` array
         sources = data.get("sources", [])
         hint_text = _sources_to_hint_text(sources)
         if hint_text:
             return hint_text
 
-        # 3. Raw map text as last resort
         return r.text
 
     except Exception:
@@ -397,7 +310,6 @@ def fetch_source_map(map_url, timeout, ua):
 # ── URL validation ────────────────────────────────────────────────────────────
 
 def _is_valid_endpoint(url: str) -> bool:
-    """Return True only if url has a proper scheme and a routable hostname."""
     try:
         p = urlparse(url)
         if p.scheme not in ("http", "https"):
@@ -428,6 +340,9 @@ def extract_endpoints(text, base_url, domain):
     for pattern in ENDPOINT_PATTERNS:
         for m in pattern.finditer(text):
             ep = m.group(1).strip()
+            # FIX 10: skip JS template literals — they are unresolvable at scan time
+            if "${" in ep:
+                continue
             resolved = ep if ep.startswith("http") else urljoin(base_url, ep)
             if _is_valid_endpoint(resolved) and _is_in_scope_endpoint(resolved, domain):
                 endpoints.add(resolved)
@@ -437,7 +352,6 @@ def extract_endpoints(text, base_url, domain):
 def extract_params(text):
     params = set()
 
-    # Single-token patterns
     for pattern in PARAM_SINGLE:
         for m in pattern.finditer(text):
             raw  = m.group(1).strip()
@@ -447,13 +361,11 @@ def extract_params(text):
             if not is_noise_param(name):
                 params.add(name)
 
-    # FIX 9: destructuring patterns — parse as destructure only
     for pattern in PARAM_BLOCK_DESTRUCTURE:
         for m in pattern.finditer(text):
             for name in _parse_destructure(m.group(1)):
                 params.add(name)
 
-    # FIX 9: object-literal patterns — parse as object keys only
     for pattern in PARAM_BLOCK_OBJECT:
         for m in pattern.finditer(text):
             for name in _parse_object_keys(m.group(1)):
@@ -467,7 +379,6 @@ def extract_secrets(text, js_url):
     for name, pattern in SECRET_PATTERNS.items():
         for m in pattern.finditer(text):
             match_str = m.group(0)
-            # Skip obvious placeholder/template values
             if re.match(r"^[xX\*<>{}|]+$", match_str):
                 continue
             secrets.append({
