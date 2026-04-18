@@ -7,6 +7,7 @@ Sources: Wayback CDX, Common Crawl, AlienVault OTX, URLScan,
 CDX limit raised to 2000 per pattern.
 CommonCrawl queries latest 3 indexes in parallel.
 OTX pulls up to 1000 URL entries per domain.
+Also harvests query-string parameter names from all merged URLs.
 """
 
 import os, shutil, subprocess, requests
@@ -85,7 +86,7 @@ def harvest_params_pre_uro(urls):
     for url in urls:
         try:
             qs = parse_qs(urlparse(url).query, keep_blank_values=True)
-            params.update(qs.keys())
+            params.update(k for k in qs.keys() if k)
         except Exception:
             pass
     return params
@@ -109,8 +110,6 @@ def dedup_with_uro(urls, workspace):
         pass
     return urls
 
-
-# ── Source harvesters ─────────────────────────────────────────────────────────
 
 CDX_PATTERNS = [
     "*.js","*/api/*","*.php","*.aspx","*.jsp",
@@ -138,7 +137,6 @@ def fetch_wayback_cdx(domain, timeout):
 
 
 def _get_latest_cc_indexes(timeout):
-    """Return the 3 most recent Common Crawl index IDs."""
     try:
         r = requests.get("https://index.commoncrawl.org/collinfo.json", timeout=timeout)
         if r.status_code == 200:
@@ -247,8 +245,6 @@ def run_katana(target_url, timeout):
         timeout,
     )
 
-
-# ── Phase runner ──────────────────────────────────────────────────────────────
 
 def run(ctx, phase_num=3, total=9):
     parsed = urlparse(ctx.target_url) if ctx.target_url else None
