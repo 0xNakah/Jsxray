@@ -50,6 +50,10 @@ CHUNK_PATTERNS_WEBPACK = [
 
 JS_EXT_RE = re.compile(r'\.js(\?[^#]*)?$', re.IGNORECASE)
 
+# Content-Types that indicate a real source map (not an HTML 404 page)
+_MAP_VALID_CT = ("application/json", "text/plain", "application/octet-stream",
+                 "application/javascript", "text/javascript")
+
 
 def _resolve(ref, base_url):
     if ref.startswith("//"): return "https:" + ref
@@ -92,24 +96,40 @@ def fetch_page_js_refs(url, timeout, ua):
 
 
 def check_source_map(js_url, timeout, ua):
+    """Return the source map URL for js_url, or None if no valid map exists.
+
+    Priority:
+      1. SourceMap / X-SourceMap response header on the JS file itself
+      2. //# sourceMappingURL= comment in the last 800 chars of the JS body
+      3. Probe <js_url>.map with a GET — validate Content-Type is JSON/text
+         to reject SPA HTML shells that return 200 for every URL
+    """
     try:
         r = requests.get(js_url, timeout=timeout,
                          headers={**HEADERS, "User-Agent": ua},
                          allow_redirects=True)
         if r.status_code != 200:
             return None
+
+        # 1. Response header
         sm = r.headers.get("SourceMap", "") or r.headers.get("X-SourceMap", "")
         if sm:
             return urljoin(js_url, sm)
+
+        # 2. Inline sourceMappingURL comment
         tail = r.text[-800:] if len(r.text) > 800 else r.text
         m = MAP_COMMENT.search(tail)
         if m:
             return urljoin(js_url, m.group(1))
+
+        # 3. Probe <js>.map — GET and validate Content-Type
         map_url = js_url.split("?")[0] + ".map"
-        rm = requests.head(map_url, timeout=timeout,
-                           headers={"User-Agent": ua}, allow_redirects=True)
+        rm = requests.get(map_url, timeout=timeout,
+                          headers={"User-Agent": ua}, allow_redirects=True)
         if rm.status_code == 200:
-            return map_url
+            ct = rm.headers.get("Content-Type", "").lower()
+            if any(ct.startswith(valid) for valid in _MAP_VALID_CT):
+                return map_url
     except Exception:
         pass
     return None
