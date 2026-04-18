@@ -12,19 +12,20 @@ from core.config  import load_config, get_phases_for_mode
 
 VALID_PHASES = [
     "intake", "subdomains", "robots", "urls",
-    "js_discovery", "js_extract", "deep", "crawl", "output",
+    "js_discovery", "js_extract", "endpoint_crawl", "deep", "crawl", "output",
 ]
 
 PHASE_MAP = {
-    "intake":       "core.intake",
-    "subdomains":   "core.subdomains",
-    "robots":       "core.robots",
-    "urls":         "core.urls",
-    "js_discovery": "core.js_discovery",
-    "js_extract":   "core.js_extract",
-    "deep":         "core.deep",
-    "crawl":        "core.crawl",
-    "output":       "core.output",
+    "intake":          "core.intake",
+    "subdomains":      "core.subdomains",
+    "robots":          "core.robots",
+    "urls":            "core.urls",
+    "js_discovery":    "core.js_discovery",
+    "js_extract":      "core.js_extract",
+    "endpoint_crawl":  "core.endpoint_crawl",
+    "deep":            "core.deep",
+    "crawl":           "core.crawl",
+    "output":          "core.output",
 }
 
 def parse_args():
@@ -33,7 +34,7 @@ def parse_args():
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 Modes:
-  quick     → intake, robots, js_discovery, js_extract, output
+  quick     → intake, robots, js_discovery, js_extract, endpoint_crawl, output
               NO external tools. robots.txt → live pages → JS files → params.
               Fast, self-contained, no gau/katana/waymore required.
 
@@ -49,7 +50,7 @@ Examples:
   python3 jsxray.py -t target.com --mode quick
   python3 jsxray.py -t target.com --mode full --silent
   python3 jsxray.py -t target.com --skip-phases deep
-  python3 jsxray.py -t target.com --phases intake,robots,js_discovery,js_extract,output
+  python3 jsxray.py -t target.com --phases intake,robots,js_discovery,js_extract,endpoint_crawl,output
   python3 jsxray.py -t target.com --timeout 120
         """
     )
