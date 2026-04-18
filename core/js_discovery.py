@@ -9,6 +9,18 @@ Strategy (quick / no-tools):
   5. Pull .js URLs already in ctx.url_pool (built by urls phase)
   6. For each JS URL: check for .map source map
 
+Feature #2 — Inline <script> extraction:
+  Each fetched seed page is also scanned for <script> blocks that have NO
+  src= attribute (inline JS). The combined text of all inline blocks is run
+  through extract_endpoints() and extract_params() immediately, so API calls
+  and parameter names embedded directly in HTML are captured even when no
+  external .js file exists.
+
+  Results land in:
+    ctx.inline_script_endpoints  — list[str]  (in-scope resolved URLs)
+    ctx.inline_script_params     — list[str]  (deduplicated param names)
+  and are merged into ctx.js_endpoints / ctx.js_global_params by js_extract.
+
 Standard/full modes add:
   - Chunk pattern enumeration (common Next.js / webpack chunk paths)
   - Cross-origin JS host crawl
@@ -19,9 +31,11 @@ from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from core.context import Context
 from core.urls import is_blocked
+from core.js_extract import extract_endpoints, extract_params
 
-SCRIPT_SRC  = re.compile(r'<script[^>]+src=["\']([^"\']+\.js[^"\']*)["\']', re.IGNORECASE)
-MAP_COMMENT = re.compile(r'(?://[#@]\s*sourceMappingURL=([^\s]+\.map))', re.IGNORECASE)
+SCRIPT_SRC    = re.compile(r'<script[^>]+src=["\']([^"\']+\.js[^"\']*)["\']', re.IGNORECASE)
+SCRIPT_INLINE = re.compile(r'<script(?![^>]*\bsrc\s*=)[^>]*>([\s\S]*?)</script>', re.IGNORECASE)
+MAP_COMMENT   = re.compile(r'(?://[#@]\s*sourceMappingURL=([^\s]+\.map))', re.IGNORECASE)
 
 HEADERS = {
     "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -54,6 +68,9 @@ JS_EXT_RE = re.compile(r'\.js(\?[^#]*)?$', re.IGNORECASE)
 _MAP_VALID_CT = ("application/json", "text/plain", "application/octet-stream",
                  "application/javascript", "text/javascript")
 
+# Minimum inline block size worth processing (skip tiny tracking pixels etc.)
+_INLINE_MIN_CHARS = 40
+
 
 def _resolve(ref, base_url):
     if ref.startswith("//"): return "https:" + ref
@@ -80,19 +97,28 @@ def _prioritize_pages(urls):
     return list(dict.fromkeys(high + normal))
 
 
-def fetch_page_js_refs(url, timeout, ua):
+def fetch_page_js_refs(url, timeout, ua, domain):
+    """Fetch a page and return (script_src_refs, inline_blocks, was_blocked).
+
+    inline_blocks is a list of non-empty inline <script> text bodies.
+    """
     try:
         r = requests.get(url, timeout=timeout,
                          headers={**HEADERS, "User-Agent": ua},
                          allow_redirects=True)
         if r.status_code != 200:
-            return [], False
+            return [], [], False
         if is_blocked(r.text, r.status_code):
-            return [], True
-        refs = SCRIPT_SRC.findall(r.text)
-        return refs, False
+            return [], [], True
+
+        refs    = SCRIPT_SRC.findall(r.text)
+        inlines = [
+            blk for blk in SCRIPT_INLINE.findall(r.text)
+            if blk.strip() and len(blk.strip()) >= _INLINE_MIN_CHARS
+        ]
+        return refs, inlines, False
     except Exception:
-        return [], False
+        return [], [], False
 
 
 def check_source_map(js_url, timeout, ua):
@@ -210,25 +236,45 @@ def run(ctx: Context, phase_num=4, total=9) -> Context:
     seed_pages = _prioritize_pages(seed_pages)
     ctx.log(f"[js_discovery] Scanning {len(seed_pages)} seed pages for JS refs...")
 
-    js_refs  = set()
-    blocked  = 0
-    pages_done = 0
+    js_refs         = set()
+    all_inline_eps  = set()
+    all_inline_pars = set()
+    blocked         = 0
+    pages_done      = 0
+    inline_blocks_total = 0
 
     with ThreadPoolExecutor(max_workers=20) as ex:
         futures = {
-            ex.submit(fetch_page_js_refs, url, ctx.timeout, ctx.user_agent): url
+            ex.submit(fetch_page_js_refs, url, ctx.timeout, ctx.user_agent, domain): url
             for url in seed_pages
         }
         for f in as_completed(futures):
-            refs, was_blocked = f.result()
+            page_url = futures[f]
+            refs, inlines, was_blocked = f.result()
             pages_done += 1
             if was_blocked:
                 blocked += 1
-            for ref in refs:
-                js_refs.add(_resolve(ref, futures[f]))
 
-    ctx.log(f"[js_discovery]   {pages_done} pages → {len(js_refs)} JS refs"
-            + (f" ({blocked} blocked)" if blocked else ""))
+            for ref in refs:
+                js_refs.add(_resolve(ref, page_url))
+
+            # Feature #2 — process inline <script> blocks immediately
+            if inlines:
+                inline_blocks_total += len(inlines)
+                combined = "\n".join(inlines)
+                for ep in extract_endpoints(combined, page_url, domain):
+                    all_inline_eps.add(ep)
+                for p in extract_params(combined):
+                    all_inline_pars.add(p)
+
+    ctx.log(
+        f"[js_discovery]   {pages_done} pages → {len(js_refs)} JS refs"
+        + (f" ({blocked} blocked)" if blocked else "")
+    )
+    ctx.log(
+        f"[js_discovery]   Inline <script> blocks: {inline_blocks_total} across pages →"
+        f" {len(all_inline_eps)} endpoints, {len(all_inline_pars)} params"
+    )
 
     wayback_js = seed_js_from_wayback(domain, ctx.timeout, ctx)
     js_refs.update(wayback_js)
@@ -273,13 +319,25 @@ def run(ctx: Context, phase_num=4, total=9) -> Context:
     ctx.js_files    = in_scope
     ctx.source_maps = source_maps
 
+    # Store inline results on context so js_extract can merge them
+    ctx.inline_script_endpoints = sorted(all_inline_eps)
+    ctx.inline_script_params    = sorted(all_inline_pars)
+
     ctx.write_text("js_files.txt", "\n".join(in_scope))
     if source_maps:
         ctx.write_json("source_maps.json",
                        [{"js": k, "map": v} for k, v in source_maps.items()])
+    if ctx.inline_script_endpoints or ctx.inline_script_params:
+        ctx.write_json("inline_scripts.json", {
+            "endpoints": ctx.inline_script_endpoints,
+            "params":    ctx.inline_script_params,
+        })
 
     ctx.phases_run.append("js_discovery")
     ctx.log_phase_done(phase_num, total, "js_discovery",
         f"{len(in_scope)} JS files | {len(source_maps)} source maps | "
-        f"{len(wayback_js)} from Wayback | {len(pool_js)} from url_pool")
+        f"{len(wayback_js)} from Wayback | {len(pool_js)} from url_pool | "
+        f"{inline_blocks_total} inline blocks | "
+        f"{len(ctx.inline_script_endpoints)} inline endpoints | "
+        f"{len(ctx.inline_script_params)} inline params")
     return ctx
