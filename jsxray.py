@@ -12,8 +12,7 @@ from core.config  import load_config, get_phases_for_mode
 
 VALID_PHASES = [
     "intake", "subdomains", "robots", "urls",
-    "js_discovery", "js_extract", "deep", "crawl",
-    "output", "monitor"
+    "js_discovery", "js_extract", "deep", "crawl", "output",
 ]
 
 PHASE_MAP = {
@@ -26,7 +25,6 @@ PHASE_MAP = {
     "deep":         "core.deep",
     "crawl":        "core.crawl",
     "output":       "core.output",
-    "monitor":      "core.monitor",
 }
 
 def parse_args():
@@ -39,13 +37,12 @@ Modes:
               NO external tools. robots.txt → live pages → JS files → params.
               Fast, self-contained, no gau/katana/waymore required.
 
-  standard  → quick + urls phase (waymore/gau/waybackurls) + deep (x8/arjun)
-              + crawl (xnLinkFinder, seeded from full pool after deep)
+  standard  → quick + urls phase (waymore/gau/waybackurls/commoncrawl/otx)
+              + deep (x8 + arjun in parallel) + crawl (xnLinkFinder)
               Best for bug bounty: max param coverage with passive sources.
 
-  full      → standard + subdomains (subfinder/httpx)
-
-  watch     → standard + monitor (diff + Discord/Telegram alerts on new findings)
+  full      → standard + subdomains
+              (subfinder, amass, crtsh, otx, rapiddns, hackertarget, anubis)
 
 Examples:
   python3 jsxray.py -t target.com
@@ -58,7 +55,7 @@ Examples:
     )
     p.add_argument("-t", "--target",     required=True,  help="Target domain or URL")
     p.add_argument("-m", "--mode",       default="standard",
-                   choices=["quick", "standard", "full", "watch"],
+                   choices=["quick", "standard", "full"],
                    help="Scan mode (default: standard)")
     p.add_argument("--phases",           help="Explicit comma-separated phase list (overrides mode)")
     p.add_argument("--skip-phases",      help="Comma-separated phases to skip")
