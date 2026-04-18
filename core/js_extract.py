@@ -44,7 +44,12 @@ FIX 11  Correct regex syntax in 4 SECRET_PATTERNS entries where a bare "
          inside an r-string was terminating the string early, causing a
          SyntaxError at import time:
            aws_secret_key, twilio_auth_token, heroku_api_key, generic_secret
-         Changed ['\\""] → ['"] (single or double quote character class).
+         Changed ['\\\""] → ['"] (single or double quote character class).
+
+FIX 12  Allow single-char HTTP params (q, s, p, t etc.).
+         is_noise_param previously dropped any name with len < 2, which
+         silently discarded the extremely common search param "q" and other
+         single-letter params.  Changed guard to len < 1 (empty string only).
 """
 
 import re, requests, json
@@ -106,7 +111,8 @@ def is_noise_param(name: str) -> bool:
     if not name:
         return True
     n = name.strip().lower()
-    if len(n) < 2 or len(n) > 40:
+    # FIX 12: allow single-char params (q, s, p, t …) — only reject empty string
+    if len(n) < 1 or len(n) > 40:
         return True
     if not re.match(r"^[a-zA-Z][a-zA-Z0-9_\-]*$", n):
         return True
@@ -129,33 +135,33 @@ def _host_in_scope(host: str, domain: str) -> bool:
 ENDPOINT_PATTERNS = [
     re.compile(
         r"""(?:fetch|axios(?:\.\w+)?|http\.(?:get|post|put|delete|patch))\s*"""
-        r"""\(\s*['\"`]([^'\"`\s]{3,}(?:/[^'\"`\s]*)?)['\"`]"""
+        r"""\(\s*['"`]([^'"`\s]{3,}(?:/[^'"`\s]*)?)['"`]"""
     ),
-    re.compile(r"""['\"`](/(?:api|v\d+|rest|graphql|ajax|service|data|endpoint|query)[^'\"`\s]{0,100})['\"`]"""),
-    re.compile(r"""['\"`](/[a-zA-Z0-9_\-./]{3,80}\?[a-zA-Z0-9_\-=&%+.]{2,100})['\"`]"""),
-    re.compile(r"""['\"`](https?://[^'\"`\s]{10,200})['\"`]"""),
-    re.compile(r"""(?:path|route|url|href|src|action)\s*[:=]\s*['\"`](/[^'\"`\s]{2,80})['\"`]"""),
+    re.compile(r"""['"`](/(?:api|v\d+|rest|graphql|ajax|service|data|endpoint|query)[^'"`\s]{0,100})['"`]"""),
+    re.compile(r"""['"`](/[a-zA-Z0-9_\-./]{3,80}\?[a-zA-Z0-9_\-=&%+.]{2,100})['"`]"""),
+    re.compile(r"""['"`](https?://[^'"`\s]{10,200})['"`]"""),
+    re.compile(r"""(?:path|route|url|href|src|action)\s*[:=]\s*['"`](/[^'"`\s]{2,80})['"`]"""),
 ]
 
 # ── Single-name parameter patterns ───────────────────────────────────────────
 PARAM_SINGLE = [
     re.compile(
         r"""(?:searchParams|URLSearchParams|params)\s*"""
-        r"""\.(?:get|append|set|has)\s*\(\s*['\"`]([a-zA-Z0-9_\-]{1,40})['\"`]"""
+        r"""\.(?:get|append|set|has)\s*\(\s*['"`]([a-zA-Z0-9_\-]{1,40})['"`]"""
     ),
     re.compile(r"""[?&]([a-zA-Z0-9_\-]{1,40})="""),
     re.compile(
-        r"""(?:params|query|qs|req\.query|args|opts)\s*[.\[]\s*['\"`]?"""
-        r"""([a-zA-Z0-9_\-]{1,40})['\"`]?"""
+        r"""(?:params|query|qs|req\.query|args|opts)\s*[.\[]\s*['"`]?"""
+        r"""([a-zA-Z0-9_\-]{1,40})['"`]?"""
     ),
     re.compile(
-        r"""(?:body|payload|data|form|req\.body)\s*(?:\.\s*|\[\s*['\"`])"""
+        r"""(?:body|payload|data|form|req\.body)\s*(?:\.\s*|\[\s*['"`])"""
         r"""([a-zA-Z0-9_\-]{1,40})"""
     ),
     re.compile(r"""(?:const|let|var)\s+([a-zA-Z0-9_]{1,30})\s*=\s*(?:params|query|searchParams)\s*\."""),
     re.compile(r"""\$([a-zA-Z0-9_]{1,30})\s*:\s*(?:String|Int|Boolean|ID|Float)"""),
-    re.compile(r"""(?:formData|formdata|form|fd|new\s+FormData\s*\(\s*\))\s*\.append\s*\(\s*['\"`]([a-zA-Z0-9_\-]{1,40})['\"`]"""),
-    re.compile(r"""\.append\s*\(\s*['\"`]([a-zA-Z0-9_\-]{1,40})['\"`]"""),
+    re.compile(r"""(?:formData|formdata|form|fd|new\s+FormData\s*\(\s*\))\s*\.append\s*\(\s*['"`]([a-zA-Z0-9_\-]{1,40})['"`]"""),
+    re.compile(r"""\.append\s*\(\s*['"`]([a-zA-Z0-9_\-]{1,40})['"`]"""),
 ]
 
 # ── Block patterns (destructuring / object literals) ─────────────────────────
@@ -293,8 +299,8 @@ def _sources_to_hint_text(sources: list) -> str:
         clean = re.sub(r'\.(?:js|ts|jsx|tsx|vue|svelte)$', '', clean, flags=re.IGNORECASE)
         if '/' not in clean:
             continue
-        clean = re.sub(r'^(?:\.\./)+'  , '/', clean)
-        clean = re.sub(r'^\.',          '/', clean)
+        clean = re.sub(r'^(?:\.\./)+', '/', clean)
+        clean = re.sub(r'^\.',         '/', clean)
         if not clean.startswith('/'):
             clean = '/' + clean
         lines.append(f'path: "{clean}"')
@@ -495,6 +501,12 @@ def run(ctx, phase_num=5, total=9):
                     f"{len(r['endpoints']):3} endpoints{sec_lbl}"
                     f"  {r['url']}"
                 )
+
+    # Merge inline script results from js_discovery (Feature #2)
+    inline_eps    = getattr(ctx, "inline_script_endpoints", [])
+    inline_params = getattr(ctx, "inline_script_params", [])
+    global_ep.update(inline_eps)
+    global_params.update(inline_params)
 
     ctx.js_global_params = sorted(global_params)
     ctx.js_endpoints     = sorted(global_ep)
