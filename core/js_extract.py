@@ -139,12 +139,12 @@ def is_noise_param(name: str) -> bool:
 ENDPOINT_PATTERNS = [
     re.compile(
         r"""(?:fetch|axios(?:\.\w+)?|http\.(?:get|post|put|delete|patch))\s*"""
-        r"""\(\s*['"` + "`" + r"]([^'"` + "`" + r"\s]{3,}(?:/[^'"` + "`" + r"\s]*)?)['\"` + "`" + r"]"""
+        r"""\(\s*['"`]([^'"`\s]{3,}(?:/[^'"`\s]*)?)['"`]"""
     ),
-    re.compile(r"""['"` + "`" + r"](/(?:api|v\d+|rest|graphql|ajax|service|data|endpoint|query)[^'"` + "`" + r"\s]{0,100})['"` + "`" + r"]"""),
-    re.compile(r"""['"` + "`" + r"](/[a-zA-Z0-9_\-./]{3,80}\?[a-zA-Z0-9_\-=&%+.]{2,100})['"` + "`" + r"]"""),
-    re.compile(r"""['"` + "`" + r"](https?://[^'"` + "`" + r"\s]{10,200})['"` + "`" + r"]"""),
-    re.compile(r"""(?:path|route|url|href|src|action)\s*[:=]\s*['"` + "`" + r"](/[^'"` + "`" + r"\s]{2,80})['"` + "`" + r"]"""),
+    re.compile(r"""['"`](/(?:api|v\d+|rest|graphql|ajax|service|data|endpoint|query)[^'"`\s]{0,100})['"`]"""),
+    re.compile(r"""['"`](/[a-zA-Z0-9_\-./]{3,80}\?[a-zA-Z0-9_\-=&%+.]{2,100})['"`]"""),
+    re.compile(r"""['"`](https?://[^'"`\s]{10,200})['"`]"""),
+    re.compile(r"""(?:path|route|url|href|src|action)\s*[:=]\s*['"`](/[^'"`\s]{2,80})['"`]"""),
 ]
 
 # ── Single-name parameter patterns ───────────────────────────────────────────
@@ -152,18 +152,18 @@ PARAM_SINGLE = [
     # URLSearchParams .get / .set / .append / .has
     re.compile(
         r"""(?:searchParams|URLSearchParams|params)\s*"""
-        r"""\.(?:get|append|set|has)\s*\(\s*['\"`]([a-zA-Z0-9_\-]{1,40})['\"`]"""
+        r"""\.(?:get|append|set|has)\s*\(\s*['"`]([a-zA-Z0-9_\-]{1,40})['"`]"""
     ),
     # query string  ?param=  &param=
     re.compile(r"""[?&]([a-zA-Z0-9_\-]{1,40})="""),
     # object property access: params.foo  query["foo"]  req.query.foo
     re.compile(
-        r"""(?:params|query|qs|req\.query|args|opts)\s*[.\[]\s*['\"`]?"""
-        r"""([a-zA-Z0-9_\-]{1,40})['\"`]?"""
+        r"""(?:params|query|qs|req\.query|args|opts)\s*[.\[]\s*['"`]?"""
+        r"""([a-zA-Z0-9_\-]{1,40})['"`]?"""
     ),
     # body / payload access — require quote or dot to avoid matching JS keywords
     re.compile(
-        r"""(?:body|payload|data|form|req\.body)\s*(?:\.\s*|\[\s*['\"`])"""
+        r"""(?:body|payload|data|form|req\.body)\s*(?:\.\s*|\[\s*['"`])"""
         r"""([a-zA-Z0-9_\-]{1,40})"""
     ),
     # const q = params.q  (captures the var name, same as the param)
@@ -171,9 +171,9 @@ PARAM_SINGLE = [
     # GraphQL: $variable: String
     re.compile(r"""\$([a-zA-Z0-9_]{1,30})\s*:\s*(?:String|Int|Boolean|ID|Float)"""),
     # FormData.append("name", ...)  fd.append('name', ...)
-    re.compile(r"""(?:formData|formdata|form|fd|new\s+FormData\s*\(\s*\))\s*\.append\s*\(\s*['\"`]([a-zA-Z0-9_\-]{1,40})['\"`]"""),
+    re.compile(r"""(?:formData|formdata|form|fd|new\s+FormData\s*\(\s*\))\s*\.append\s*\(\s*['"`]([a-zA-Z0-9_\-]{1,40})['"`]"""),
     # generic .append('name', ...) chains
-    re.compile(r"""\.append\s*\(\s*['\"`]([a-zA-Z0-9_\-]{1,40})['\"`]"""),
+    re.compile(r"""\.append\s*\(\s*['"`]([a-zA-Z0-9_\-]{1,40})['"`]"""),
 ]
 
 # ── Block patterns (destructuring / object literals) ─────────────────────────
@@ -204,13 +204,55 @@ PARAM_BLOCK_OBJECT = [
     re.compile(r"""qs\.stringify\s*\(\s*\{([^}]{1,300})\}\s*\)"""),
 ]
 
-SECRET_PATTERNS = [
-    re.compile(
-        r"""(?:api[_\-]?key|apikey|secret|token|auth[_\-]?key|access[_\-]?key)"""
-        r"""\s*[:=]\s*['\"`]([A-Za-z0-9\-_./+]{10,80})['\"`]""",
-        re.IGNORECASE,
-    ),
-]
+# ── Secret patterns (TruffleHog-aligned) ─────────────────────────────────────
+SECRET_PATTERNS = {
+    # Cloud — AWS
+    "aws_access_key":        re.compile(r"(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}"),
+    "aws_secret_key":        re.compile(r"(?i)aws.{0,20}['\"][0-9a-zA-Z/+]{40}['\"]"),
+
+    # Cloud — Azure
+    "azure_storage_conn":    re.compile(r"DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{88}"),
+    "azure_sas_token":       re.compile(r"(?i)sv=\d{4}-\d{2}-\d{2}&s[sco]=.{10,200}&sig=[A-Za-z0-9%+/=]{40,}"),
+
+    # Cloud — GCP
+    "gcp_service_account":   re.compile(r'"type"\s*:\s*"service_account"'),
+    "gcp_api_key":           re.compile(r"AIza[0-9A-Za-z\-_]{35}"),
+
+    # Payment & Finance
+    "stripe_live_key":       re.compile(r"sk_live_[0-9a-zA-Z]{24,}"),
+    "stripe_restricted_key": re.compile(r"rk_live_[0-9a-zA-Z]{24,}"),
+    "paypal_braintree":      re.compile(r"access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}"),
+    "square_token":          re.compile(r"sq0atp-[0-9A-Za-z\-_]{22}"),
+    "square_oauth_secret":   re.compile(r"sq0csp-[0-9A-Za-z\-_]{43}"),
+
+    # Tokens & Auth
+    "jwt_token":             re.compile(r"eyJ[A-Za-z0-9\-_=]+\.eyJ[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_.+/=]*"),
+    "github_pat":            re.compile(r"ghp_[0-9a-zA-Z]{36}"),
+    "github_oauth":          re.compile(r"gho_[0-9a-zA-Z]{36}"),
+    "github_app_token":      re.compile(r"(?:ghu|ghs)_[0-9a-zA-Z]{36}"),
+    "gitlab_pat":            re.compile(r"glpat-[0-9a-zA-Z\-_]{20}"),
+    "npmrc_token":           re.compile(r"//registry\.npmjs\.org/:_authToken=[0-9a-zA-Z\-_]{36,}"),
+
+    # AI / LLM
+    "openai_key":            re.compile(r"sk-[a-zA-Z0-9]{20}T3BlbkFJ[a-zA-Z0-9]{20}"),
+    "anthropic_key":         re.compile(r"sk-ant-api\d{2}-[A-Za-z0-9\-_]{93}AA"),
+
+    # Communication
+    "slack_token":           re.compile(r"xox[baprs]-[0-9a-zA-Z\-]{10,250}"),
+    "slack_webhook":         re.compile(r"https://hooks\.slack\.com/services/T[a-zA-Z0-9_]{8}/B[a-zA-Z0-9_]{8,}/[a-zA-Z0-9_]{24}"),
+    "twilio_account_sid":    re.compile(r"AC[a-z0-9]{32}"),
+    "twilio_auth_token":     re.compile(r"(?i)twilio.{0,20}['\"][a-f0-9]{32}['\"]"),
+    "sendgrid_key":          re.compile(r"SG\.[a-zA-Z0-9\-_]{22}\.[a-zA-Z0-9\-_]{43}"),
+    "mailchimp_key":         re.compile(r"[0-9a-f]{32}-us[0-9]{1,2}"),
+
+    # Infrastructure
+    "generic_db_conn":       re.compile(r"(?i)(?:mongodb|mysql|postgres|redis|mssql)://[^:]+:[^@]+@[^\s\"']+"),
+    "private_key_pem":       re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    "heroku_api_key":        re.compile(r"(?i)[hH]eroku.{0,20}['\"][0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}['\"]"),
+
+    # Generic high-entropy fallback
+    "generic_secret":        re.compile(r"(?i)(?:secret|api_key|apikey|token|passwd|password|auth)['\"]?\s*[:=]\s*['\"]([A-Za-z0-9\-_/+]{20,})['\"]"),
+}
 
 
 # ── Block parsers ─────────────────────────────────────────────────────────────
@@ -409,11 +451,17 @@ def extract_params(text):
 
 def extract_secrets(text, js_url):
     secrets = []
-    for pattern in SECRET_PATTERNS:
+    for name, pattern in SECRET_PATTERNS.items():
         for m in pattern.finditer(text):
-            value = m.group(1)
-            if not re.match(r"^[xX\*<>{}|]+$", value):
-                secrets.append({"url": js_url, "match": m.group(0)[:120]})
+            match_str = m.group(0)
+            # Skip obvious placeholder/template values
+            if re.match(r"^[xX\*<>{}|]+$", match_str):
+                continue
+            secrets.append({
+                "url":       js_url,
+                "type":      name,
+                "match":     match_str[:120],
+            })
     return secrets
 
 
