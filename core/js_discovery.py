@@ -4,7 +4,7 @@ js_discovery.py — JS File Discovery
 Strategy (quick / no-tools):
   1. Fetch canonical root page → extract <script src=...>
   2. Fetch each live robots.txt page → extract <script src=...>
-  3. Fetch sitemap-seeded pages (up to N) → extract <script src=...>
+  3. Fetch sitemap-seeded pages (prioritised, up to N) → extract <script src=...>
   4. Wayback CDX passive JS URL lookup (no target contact)
   5. Pull .js URLs already in ctx.url_pool (built by urls phase)
   6. For each JS URL: check for .map source map
@@ -29,7 +29,6 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.5",
 }
 
-# Common Next.js / webpack / Vite chunk paths to try if we detect the framework
 CHUNK_PATTERNS_NEXTJS = [
     "/_next/static/chunks/main.js",
     "/_next/static/chunks/pages/_app.js",
@@ -51,15 +50,27 @@ CHUNK_PATTERNS_WEBPACK = [
 
 JS_EXT_RE = re.compile(r'\.js(\?[^#]*)?$', re.IGNORECASE)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _resolve(ref, base_url):
     if ref.startswith("//"): return "https:" + ref
     if ref.startswith("http"): return ref
     return urljoin(base_url, ref)
 
+
+def _prioritize_pages(urls):
+    """Put parameterized and high-value pages first before applying caps."""
+    high, normal = [], []
+    keywords = ("search", "query", "redirect", "callback", "return", "api", "ajax", "graphql")
+    for url in urls:
+        lu = url.lower()
+        if "?" in url or any(k in lu for k in keywords):
+            high.append(url)
+        else:
+            normal.append(url)
+    return list(dict.fromkeys(high + normal))
+
+
 def fetch_page_js_refs(url, timeout, ua):
-    """GET a page and return all JS src references found. Returns (refs[], blocked)."""
     try:
         r = requests.get(url, timeout=timeout,
                          headers={**HEADERS, "User-Agent": ua},
@@ -73,8 +84,8 @@ def fetch_page_js_refs(url, timeout, ua):
     except Exception:
         return [], False
 
+
 def check_source_map(js_url, timeout, ua):
-    """Check if a JS file has a source map. Returns map URL or None."""
     try:
         r = requests.get(js_url, timeout=timeout,
                          headers={**HEADERS, "User-Agent": ua},
@@ -97,8 +108,8 @@ def check_source_map(js_url, timeout, ua):
         pass
     return None
 
+
 def seed_js_from_wayback(domain, timeout, ctx):
-    """Passive JS discovery via Wayback CDX — never touches target server."""
     ctx.log("[js_discovery] Passive JS seed via Wayback CDX...")
     try:
         r = requests.get("https://web.archive.org/cdx/search/cdx", params={
@@ -118,8 +129,8 @@ def seed_js_from_wayback(domain, timeout, ctx):
         ctx.log(f"[js_discovery]   Wayback CDX error: {e}")
     return []
 
+
 def try_chunk_patterns(base_url, tech_stack, timeout, ua):
-    """Try known chunk paths based on detected tech stack."""
     patterns = []
     tech_lower = [t.lower() for t in tech_stack]
     if "next.js" in tech_lower:
@@ -141,15 +152,14 @@ def try_chunk_patterns(base_url, tech_stack, timeout, ua):
             pass
     return found
 
+
 def _is_js_url(url):
-    """Return True if URL path ends in .js (ignoring query string)."""
     try:
         path = urlparse(url).path
         return bool(JS_EXT_RE.search(path))
     except Exception:
         return False
 
-# ── Phase runner ──────────────────────────────────────────────────────────────
 
 def run(ctx: Context, phase_num=4, total=9) -> Context:
     base_url   = getattr(ctx, "canonical_url", None) or ctx.target_url
@@ -159,23 +169,21 @@ def run(ctx: Context, phase_num=4, total=9) -> Context:
 
     ctx.log(f"[js_discovery] Base: {base_url}  mode={mode}")
 
-    # ── Step 1: Seed pages to crawl for <script src=...> ─────────────────────
     seed_pages = [base_url]
 
     for r in ctx.robots_live:
-        if r.get("status") == 200:
+        if r.get("status") in (200, 401, 403):
             seed_pages.append(r.get("resolved_url") or r["url"])
 
-    seed_pages += ctx.sitemap_urls[:30]
+    seed_pages += ctx.sitemap_urls[:100]
 
-    for u in ctx.url_pool[:50]:
-        if "?" in u:
-            seed_pages.append(u)
+    prioritized_pool = _prioritize_pages(ctx.url_pool)
+    for u in prioritized_pool[:150]:
+        seed_pages.append(u)
 
-    seed_pages = list(dict.fromkeys(seed_pages))
+    seed_pages = _prioritize_pages(seed_pages)
     ctx.log(f"[js_discovery] Scanning {len(seed_pages)} seed pages for JS refs...")
 
-    # ── Step 2: Parallel page fetch → JS ref extraction ──────────────────────
     js_refs  = set()
     blocked  = 0
     pages_done = 0
@@ -196,23 +204,19 @@ def run(ctx: Context, phase_num=4, total=9) -> Context:
     ctx.log(f"[js_discovery]   {pages_done} pages → {len(js_refs)} JS refs"
             + (f" ({blocked} blocked)" if blocked else ""))
 
-    # ── Step 3: Wayback CDX passive JS seed ───────────────────────────────────
     wayback_js = seed_js_from_wayback(domain, ctx.timeout, ctx)
     js_refs.update(wayback_js)
 
-    # ── Step 4: Chunk pattern probe (standard/full) ───────────────────────────
     if mode in ("standard", "full"):
         ctx.log("[js_discovery] Probing common chunk patterns...")
         chunk_js = try_chunk_patterns(base_url, tech_stack, ctx.timeout, ctx.user_agent)
         ctx.log(f"[js_discovery]   Chunk patterns → {len(chunk_js)} found")
         js_refs.update(chunk_js)
 
-    # ── Step 5: Drain .js URLs already in ctx.url_pool (built by urls phase) ──
     pool_js = [u for u in ctx.url_pool if _is_js_url(u)]
     ctx.log(f"[js_discovery]   url_pool .js drain → {len(pool_js)} URLs")
     js_refs.update(pool_js)
 
-    # ── Step 6: Filter to in-scope JS files ──────────────────────────────────
     in_scope = []
     for url in js_refs:
         try:
@@ -226,7 +230,6 @@ def run(ctx: Context, phase_num=4, total=9) -> Context:
     in_scope = list(dict.fromkeys(in_scope))
     ctx.log(f"[js_discovery]   In-scope JS files: {len(in_scope)}")
 
-    # ── Step 7: Source map detection (parallel) ───────────────────────────────
     ctx.log(f"[js_discovery] Checking {len(in_scope)} JS files for source maps...")
     source_maps = {}
 
