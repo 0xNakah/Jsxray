@@ -39,6 +39,12 @@ FIX 9   extract_params no longer double-passes PARAM_BLOCK entries.
 FIX 10  extract_endpoints drops resolved URLs that still contain ${ —
          these are JS template literals (e.g. `${this.host}/api/`) and
          are unresolvable junk that pollutes the endpoint list.
+
+FIX 11  Correct regex syntax in 4 SECRET_PATTERNS entries where a bare "
+         inside an r-string was terminating the string early, causing a
+         SyntaxError at import time:
+           aws_secret_key, twilio_auth_token, heroku_api_key, generic_secret
+         Changed ['\\""] → ['"] (single or double quote character class).
 """
 
 import re, requests, json
@@ -168,35 +174,52 @@ PARAM_BLOCK_OBJECT = [
 
 # ── Secret patterns (TruffleHog-aligned) ─────────────────────────────────────
 SECRET_PATTERNS = {
+    # Cloud — AWS
     "aws_access_key":        re.compile(r"(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}"),
-    "aws_secret_key":        re.compile(r"(?i)aws.{0,20}['\""][0-9a-zA-Z/+]{40}['\"]"),
+    "aws_secret_key":        re.compile(r'(?i)aws.{0,20}[\'"][0-9a-zA-Z/+]{40}[\'"]'),
+
+    # Cloud — Azure
     "azure_storage_conn":    re.compile(r"DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{88}"),
     "azure_sas_token":       re.compile(r"(?i)sv=\d{4}-\d{2}-\d{2}&s[sco]=.{10,200}&sig=[A-Za-z0-9%+/=]{40,}"),
+
+    # Cloud — GCP
     "gcp_service_account":   re.compile(r'"type"\s*:\s*"service_account"'),
     "gcp_api_key":           re.compile(r"AIza[0-9A-Za-z\-_]{35}"),
+
+    # Payment & Finance
     "stripe_live_key":       re.compile(r"sk_live_[0-9a-zA-Z]{24,}"),
     "stripe_restricted_key": re.compile(r"rk_live_[0-9a-zA-Z]{24,}"),
     "paypal_braintree":      re.compile(r"access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}"),
     "square_token":          re.compile(r"sq0atp-[0-9A-Za-z\-_]{22}"),
     "square_oauth_secret":   re.compile(r"sq0csp-[0-9A-Za-z\-_]{43}"),
+
+    # Tokens & Auth
     "jwt_token":             re.compile(r"eyJ[A-Za-z0-9\-_=]+\.eyJ[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_.+/=]*"),
     "github_pat":            re.compile(r"ghp_[0-9a-zA-Z]{36}"),
     "github_oauth":          re.compile(r"gho_[0-9a-zA-Z]{36}"),
     "github_app_token":      re.compile(r"(?:ghu|ghs)_[0-9a-zA-Z]{36}"),
     "gitlab_pat":            re.compile(r"glpat-[0-9a-zA-Z\-_]{20}"),
     "npmrc_token":           re.compile(r"//registry\.npmjs\.org/:_authToken=[0-9a-zA-Z\-_]{36,}"),
+
+    # AI / LLM
     "openai_key":            re.compile(r"sk-[a-zA-Z0-9]{20}T3BlbkFJ[a-zA-Z0-9]{20}"),
     "anthropic_key":         re.compile(r"sk-ant-api\d{2}-[A-Za-z0-9\-_]{93}AA"),
+
+    # Communication
     "slack_token":           re.compile(r"xox[baprs]-[0-9a-zA-Z\-]{10,250}"),
     "slack_webhook":         re.compile(r"https://hooks\.slack\.com/services/T[a-zA-Z0-9_]{8}/B[a-zA-Z0-9_]{8,}/[a-zA-Z0-9_]{24}"),
     "twilio_account_sid":    re.compile(r"AC[a-z0-9]{32}"),
-    "twilio_auth_token":     re.compile(r"(?i)twilio.{0,20}['\""][a-f0-9]{32}['\"]"),
+    "twilio_auth_token":     re.compile(r'(?i)twilio.{0,20}[\'"][a-f0-9]{32}[\'"]'),
     "sendgrid_key":          re.compile(r"SG\.[a-zA-Z0-9\-_]{22}\.[a-zA-Z0-9\-_]{43}"),
     "mailchimp_key":         re.compile(r"[0-9a-f]{32}-us[0-9]{1,2}"),
-    "generic_db_conn":       re.compile(r"(?i)(?:mongodb|mysql|postgres|redis|mssql)://[^:]+:[^@]+@[^\s\"']+"),
+
+    # Infrastructure
+    "generic_db_conn":       re.compile(r'(?i)(?:mongodb|mysql|postgres|redis|mssql)://[^:]+:[^@]+@[^\s"\']+'),
     "private_key_pem":       re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-    "heroku_api_key":        re.compile(r"(?i)[hH]eroku.{0,20}['\""][0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}['\"]"),
-    "generic_secret":        re.compile(r"(?i)(?:secret|api_key|apikey|token|passwd|password|auth)['\"]?\s*[:=]\s*['\""]([A-Za-z0-9\-_/+]{20,})['\"]"),
+    "heroku_api_key":        re.compile(r'(?i)[hH]eroku.{0,20}[\'"][0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}[\'"]'),
+
+    # Generic high-entropy fallback
+    "generic_secret":        re.compile(r'(?i)(?:secret|api_key|apikey|token|passwd|password|auth)[\'"]?\s*[:=]\s*[\'"]([A-Za-z0-9\-_/+]{20,})[\'"]'),
 }
 
 
