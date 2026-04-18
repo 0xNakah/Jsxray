@@ -57,6 +57,12 @@ def _resolve(ref, base_url):
     return urljoin(base_url, ref)
 
 
+def _host_in_scope(host: str, domain: str) -> bool:
+    host = (host or "").lower().lstrip("www.")
+    base = (domain or "").lower().lstrip("www.")
+    return bool(host) and bool(base) and (host == base or host.endswith("." + base))
+
+
 def _prioritize_pages(urls):
     """Put parameterized and high-value pages first before applying caps."""
     high, normal = [], []
@@ -220,9 +226,8 @@ def run(ctx: Context, phase_num=4, total=9) -> Context:
     in_scope = []
     for url in js_refs:
         try:
-            host = urlparse(url).netloc.lower()
-            bare = domain.lower()
-            if host == bare or host.endswith("." + bare) or bare in host:
+            host = urlparse(url).netloc
+            if _host_in_scope(host, domain):
                 in_scope.append(url)
         except Exception:
             pass
