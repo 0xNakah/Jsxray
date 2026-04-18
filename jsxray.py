@@ -11,10 +11,23 @@ from core.context import Context
 from core.config  import load_config, get_phases_for_mode
 
 VALID_PHASES = [
-    "intake","subdomains","robots","urls",
-    "js_discovery","js_extract","deep","crawl",
-    "probe","score","output","monitor"
+    "intake", "subdomains", "robots", "urls",
+    "js_discovery", "js_extract", "deep", "crawl",
+    "output", "monitor"
 ]
+
+PHASE_MAP = {
+    "intake":       "core.intake",
+    "subdomains":   "core.subdomains",
+    "robots":       "core.robots",
+    "urls":         "core.urls",
+    "js_discovery": "core.js_discovery",
+    "js_extract":   "core.js_extract",
+    "deep":         "core.deep",
+    "crawl":        "core.crawl",
+    "output":       "core.output",
+    "monitor":      "core.monitor",
+}
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -22,7 +35,7 @@ def parse_args():
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 Modes:
-  quick     → intake, robots, js_discovery, js_extract, probe, score, output
+  quick     → intake, robots, js_discovery, js_extract, output
               NO external tools. robots.txt → live pages → JS files → params.
               Fast, self-contained, no gau/katana/waymore required.
 
@@ -38,25 +51,25 @@ Examples:
   python3 jsxray.py -t target.com
   python3 jsxray.py -t target.com --mode quick
   python3 jsxray.py -t target.com --mode full --silent
-  python3 jsxray.py -t target.com --skip-phases deep,probe
+  python3 jsxray.py -t target.com --skip-phases deep
   python3 jsxray.py -t target.com --phases intake,robots,js_discovery,js_extract,output
   python3 jsxray.py -t target.com --timeout 120
         """
     )
-    p.add_argument("-t","--target",       required=True,  help="Target domain or URL")
-    p.add_argument("-m","--mode",         default="standard",
-                   choices=["quick","standard","full","watch"],
+    p.add_argument("-t", "--target",     required=True,  help="Target domain or URL")
+    p.add_argument("-m", "--mode",       default="standard",
+                   choices=["quick", "standard", "full", "watch"],
                    help="Scan mode (default: standard)")
-    p.add_argument("--phases",            help="Explicit comma-separated phase list (overrides mode)")
-    p.add_argument("--skip-phases",       help="Comma-separated phases to skip")
-    p.add_argument("-o","--output-dir",   default=None,   help="Output directory (default: recon/)")
-    p.add_argument("--config",            default=None,   help="Path to jsxray.toml")
-    p.add_argument("--port",              type=int, default=None, help="Dashboard port (default: 5000)")
-    p.add_argument("--timeout",           type=int, default=None,
+    p.add_argument("--phases",           help="Explicit comma-separated phase list (overrides mode)")
+    p.add_argument("--skip-phases",      help="Comma-separated phases to skip")
+    p.add_argument("-o", "--output-dir", default=None,   help="Output directory (default: recon/)")
+    p.add_argument("--config",           default=None,   help="Path to jsxray.toml")
+    p.add_argument("--port",             type=int, default=None, help="Dashboard port (default: 5000)")
+    p.add_argument("--timeout",          type=int, default=None,
                    help="HTTP timeout in seconds (default: 60)")
-    p.add_argument("-s","--silent",       action="store_true",
+    p.add_argument("-s", "--silent",     action="store_true",
                    help="Silent mode — only print compact phase summaries")
-    p.add_argument("--no-dashboard",      action="store_true",
+    p.add_argument("--no-dashboard",     action="store_true",
                    help="Skip launching the web dashboard")
     return p.parse_args()
 
@@ -75,21 +88,7 @@ def build_phase_list(args, config):
     return phases
 
 def run_phase(phase_name, ctx, phase_num, total):
-    module_map = {
-        "intake":       "core.intake",
-        "subdomains":   "core.subdomains",
-        "robots":       "core.robots",
-        "urls":         "core.urls",
-        "js_discovery": "core.js_discovery",
-        "js_extract":   "core.js_extract",
-        "deep":         "core.deep",
-        "crawl":        "core.crawl",
-        "probe":        "core.probe",
-        "score":        "core.score",
-        "output":       "core.output",
-        "monitor":      "core.monitor",
-    }
-    module_path = module_map.get(phase_name)
+    module_path = PHASE_MAP.get(phase_name)
     if not module_path:
         print(f"[jsxray] Unknown phase: {phase_name} — skipping")
         return ctx
@@ -101,6 +100,7 @@ def run_phase(phase_name, ctx, phase_num, total):
         print(f"[jsxray] Phase '{phase_name}' failed: {e}")
         import traceback; traceback.print_exc()
         ctx.log_error(phase_name, str(e))
+        ctx.failed_phases.append(phase_name)
     return ctx
 
 def launch_dashboard(workspace, port):
@@ -152,6 +152,9 @@ def main():
 
     elapsed = time.time() - t0
     print(f"\n[jsxray] Done in {elapsed:.1f}s  →  {ctx.workspace}/")
+
+    if ctx.failed_phases:
+        print(f"[jsxray] ⚠  Failed phases: {', '.join(ctx.failed_phases)}")
 
     if not args.no_dashboard:
         port = config["defaults"].get("port", 5000)

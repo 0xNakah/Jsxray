@@ -19,7 +19,7 @@ class Context:
     silent:        bool = False
 
     # ── Intake ────────────────────────────────────────────────────────────────
-    tech_stack:    list = field(default_factory=list)   # fingerprinted stack
+    tech_stack:    list = field(default_factory=list)
     robots_raw:    str  = ""
     robots_paths:  list = field(default_factory=list)
     robots_live:   list = field(default_factory=list)
@@ -31,13 +31,13 @@ class Context:
 
     # ── URLs ──────────────────────────────────────────────────────────────────
     url_pool:         list = field(default_factory=list)
-    url_sources:      dict = field(default_factory=dict)   # source → count
+    url_sources:      dict = field(default_factory=dict)
 
     # ── JS discovery ──────────────────────────────────────────────────────────
     js_files:         list = field(default_factory=list)
     source_maps:      dict = field(default_factory=dict)
 
-    # ── JS extraction ────────────────────────────────────────────────────────
+    # ── JS extraction ─────────────────────────────────────────────────────────
     js_param_map:     dict = field(default_factory=dict)
     js_global_params: list = field(default_factory=list)
     js_endpoints:     list = field(default_factory=list)
@@ -46,15 +46,12 @@ class Context:
     # ── Deep ──────────────────────────────────────────────────────────────────
     hidden_params:    dict = field(default_factory=dict)
 
-    # ── Probe / Score / Output ────────────────────────────────────────────────
-    reflections:      list = field(default_factory=list)
-    findings:         list = field(default_factory=list)
-
     # ── Monitor ───────────────────────────────────────────────────────────────
     diff:             dict = field(default_factory=dict)
 
     # ── Meta ──────────────────────────────────────────────────────────────────
     phases_run:       list = field(default_factory=list)
+    failed_phases:    list = field(default_factory=list)
     errors:           list = field(default_factory=list)
     scan_start:       float = field(default_factory=lambda: __import__('time').time())
 
@@ -96,15 +93,17 @@ class Context:
         return round(time.time() - self.scan_start, 1)
 
     def to_summary(self):
+        secret_count = sum(len(fd.get("secrets", [])) for fd in self.js_file_data)
         return {
-            "target":       self.target,
+            "target":        self.target,
             "canonical_url": self.canonical_url,
-            "timestamp":    self.timestamp,
-            "mode":         self.mode,
-            "elapsed_s":    self.elapsed(),
-            "phases_run":   self.phases_run,
-            "tech_stack":   self.tech_stack,
-            "errors":       self.errors,
+            "timestamp":     self.timestamp,
+            "mode":          self.mode,
+            "elapsed_s":     self.elapsed(),
+            "phases_run":    self.phases_run,
+            "failed_phases": self.failed_phases,
+            "tech_stack":    self.tech_stack,
+            "errors":        self.errors,
             "stats": {
                 "robots_paths":     len(self.robots_paths),
                 "robots_live":      len([r for r in self.robots_live if r.get("status") == 200]),
@@ -117,11 +116,6 @@ class Context:
                 "js_endpoints":     len(self.js_endpoints),
                 "js_global_params": len(self.js_global_params),
                 "hidden_params":    sum(len(v) for v in self.hidden_params.values()),
-                "reflections":      len(self.reflections),
-                "findings":         len(self.findings),
-                "critical":         len([f for f in self.findings if f.get("priority") == "critical"]),
-                "high":             len([f for f in self.findings if f.get("priority") == "high"]),
-                "medium":           len([f for f in self.findings if f.get("priority") == "medium"]),
-                "low":              len([f for f in self.findings if f.get("priority") == "low"]),
+                "secret_hints":     secret_count,
             },
         }

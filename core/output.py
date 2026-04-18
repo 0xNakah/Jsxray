@@ -1,26 +1,45 @@
+import shutil
 from core.context import Context
 
-EMOJI = {"critical":"🔴","high":"🟠","medium":"🟡","low":"🔵"}
+def _trunc(s, width):
+    s = str(s)
+    return s if len(s) <= width else s[:width - 1] + "…"
 
-def burp_queue(findings):
-    lines = ["# JSXray — Burp Queue (sorted by score)",
-             "# Paste into Burp Repeater / Intruder\n"]
-    for f in findings:
-        csp_n = "no-csp" if f.get("csp_missing") else ("unsafe-inline" if f.get("csp_unsafe_inline") else "has-csp")
-        pay   = " | ".join(f.get("payloads",[])[:2])
+def secrets_report(secrets):
+    lines = ["# JSXray — Secret Hints", "# Review each match manually before reporting\n"]
+    for s in secrets:
         lines.append(
-            f"[{f['priority'].upper()}] {f['probe_url']}\n"
-            f"  param={f['param']}  context={f.get('context','?')}  csp={csp_n}  score={f['score']}\n"
-            f"  payloads: {pay}\n"
-            f"  source: {f.get('source','?')}\n"
+            f"[{s['type'].upper()}]\n"
+            f"  file  : {s['url']}\n"
+            f"  match : {s['match']}\n"
         )
+    return "\n".join(lines)
+
+def nuclei_targets(js_endpoints, js_param_map):
+    lines = ["# JSXray — Nuclei / ffuf targets", "# Format: URL  (params as comment)\n"]
+    for ep in js_endpoints:
+        params = js_param_map.get(ep, [])
+        comment = f"  # params: {', '.join(params[:10])}" if params else ""
+        lines.append(f"{ep}{comment}")
     return "\n".join(lines)
 
 def run(ctx: Context, phase_num=9, total=9) -> Context:
     summary = ctx.to_summary()
     ctx.write_json("summary.json", summary)
-    ctx.write_json("reflections.json", ctx.findings)
-    ctx.write_text("burp_queue.txt", burp_queue(ctx.findings))
+
+    secrets = []
+    for fd in ctx.js_file_data:
+        secrets.extend(fd.get("secrets", []))
+
+    if secrets:
+        ctx.write_text("secrets_report.txt", secrets_report(secrets))
+        ctx.write_json("secrets.json", secrets)
+
+    if ctx.js_endpoints:
+        ctx.write_text("nuclei_targets.txt", nuclei_targets(ctx.js_endpoints, ctx.js_param_map))
+
+    term_w = shutil.get_terminal_size((120, 24)).columns
+    url_w  = max(40, term_w - 60)
 
     s = summary["stats"]
     print(f"\n{'='*60}")
@@ -35,18 +54,20 @@ def run(ctx: Context, phase_num=9, total=9) -> Context:
     print(f"  JS files   : {s['js_files']} files  ({s['source_maps']} source maps)")
     print(f"  Endpoints  : {s['js_endpoints']} extracted")
     print(f"  Params     : {s['js_global_params']} extracted  (+{s['hidden_params']} hidden)")
-    print(f"  Reflections: {s['reflections']} probed")
+    if secrets:
+        print(f"  Secrets    : {len(secrets)} hints  → secrets_report.txt")
+    if ctx.failed_phases:
+        print(f"  ⚠  Failed  : {', '.join(ctx.failed_phases)}")
     print(f"{'─'*60}")
-    print(f"  🔴 Critical : {s['critical']}")
-    print(f"  🟠 High     : {s['high']}")
-    print(f"  🟡 Medium   : {s['medium']}")
-    print(f"  🔵 Low      : {s['low']}")
-    if ctx.findings:
-        print(f"{'─'*60}")
-        print(f"  Top findings:")
-        for f in ctx.findings[:5]:
-            e = EMOJI.get(f['priority'],'⚪')
-            print(f"  {e} [{f['score']:>3}] {f['param']:<20} {f['url'][:48]}")
+    if ctx.js_global_params:
+        from core.js_extract import HIGH_VALUE_PARAMS
+        hv = [p for p in ctx.js_global_params if p in HIGH_VALUE_PARAMS]
+        if hv:
+            print(f"  High-value params: {', '.join(hv[:15])}")
+    if ctx.js_endpoints:
+        print(f"  Top endpoints:")
+        for ep in ctx.js_endpoints[:5]:
+            print(f"    {_trunc(ep, url_w)}")
     print(f"{'='*60}")
     print(f"\n[jsxray] Results → {ctx.workspace}/")
 
