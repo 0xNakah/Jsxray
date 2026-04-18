@@ -1,13 +1,12 @@
 """
 urls.py — URL Harvest Phase
 
-FIX 4:  Before calling uro to deduplicate the full URL pool we now extract
-        every unique query-parameter name from the raw (pre-uro) list and
-        store them in ctx.pre_uro_params.  probe.py will inject each of
-        those params onto the root URL so nothing discovered pre-dedup is lost.
+Sources: Wayback CDX, Common Crawl, AlienVault OTX, URLScan,
+         gau, waybackurls, waymore, katana (full mode).
 
-NOTE:   xnLinkFinder has been moved to core/crawl.py (runs after deep)
-        so it is seeded with the full, source-map-augmented URL pool.
+CDX limit raised to 2000 per pattern.
+CommonCrawl queries latest 3 indexes in parallel.
+OTX pulls up to 1000 URL entries per domain.
 """
 
 import os, shutil, subprocess, requests
@@ -82,7 +81,6 @@ def merge_and_filter(batches, domain):
 
 
 def harvest_params_pre_uro(urls):
-    """Return every query-param name seen across the raw (pre-uro) URL list."""
     params = set()
     for url in urls:
         try:
@@ -116,8 +114,9 @@ def dedup_with_uro(urls, workspace):
 
 CDX_PATTERNS = [
     "*.js","*/api/*","*.php","*.aspx","*.jsp",
-    "*/search*","*/v1/*","*/v2/*","*/graphql*",
-    "*/rest/*","*/ajax/*","*?*",
+    "*/search*","*/v1/*","*/v2/*","*/v3/*","*/graphql*",
+    "*/rest/*","*/ajax/*","*/admin/*","*/user/*","*/account/*",
+    "*?*",
 ]
 
 def fetch_wayback_cdx(domain, timeout):
@@ -128,13 +127,87 @@ def fetch_wayback_cdx(domain, timeout):
             r = requests.get(base, params={
                 "url": f"{domain}/{pat}", "output": "text",
                 "fl": "original", "collapse": "urlkey",
-                "limit": "500", "filter": "statuscode:200",
+                "limit": "2000", "filter": "statuscode:200",
             }, timeout=timeout)
             if r.status_code == 200 and r.text.strip():
                 urls.extend([u.strip() for u in r.text.strip().split("\n")
                               if u.strip().startswith("http")])
         except Exception:
             pass
+    return _dedup(urls)
+
+
+def _get_latest_cc_indexes(timeout):
+    """Return the 3 most recent Common Crawl index IDs."""
+    try:
+        r = requests.get("https://index.commoncrawl.org/collinfo.json", timeout=timeout)
+        if r.status_code == 200:
+            indexes = r.json()
+            return [idx["id"] for idx in indexes[:3]]
+    except Exception:
+        pass
+    return ["CC-MAIN-2024-10", "CC-MAIN-2023-50", "CC-MAIN-2023-40"]
+
+
+def _fetch_cc_index(index_id, domain, timeout):
+    urls = []
+    try:
+        r = requests.get(
+            f"https://index.commoncrawl.org/{index_id}-index",
+            params={"url": f"*.{domain}/*", "output": "json", "limit": "1000"},
+            timeout=timeout,
+        )
+        if r.status_code == 200:
+            for line in r.text.strip().splitlines():
+                try:
+                    import json
+                    obj = json.loads(line)
+                    u = obj.get("url", "")
+                    if u.startswith("http"):
+                        urls.append(u)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return urls
+
+
+def fetch_commoncrawl(domain, timeout):
+    indexes = _get_latest_cc_indexes(timeout)
+    urls = []
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futures = {ex.submit(_fetch_cc_index, idx, domain, timeout): idx for idx in indexes}
+        for fut in as_completed(futures):
+            try:
+                urls.extend(fut.result())
+            except Exception:
+                pass
+    return _dedup(urls)
+
+
+def fetch_otx(domain, timeout):
+    urls = []
+    page = 1
+    while page <= 10:
+        try:
+            r = requests.get(
+                f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/url_list",
+                params={"limit": "100", "page": str(page)},
+                timeout=timeout,
+                headers={"User-Agent": "jsxray/0.2"},
+            )
+            if r.status_code != 200:
+                break
+            data = r.json()
+            batch = [e.get("url", "") for e in data.get("url_list", []) if e.get("url", "").startswith("http")]
+            if not batch:
+                break
+            urls.extend(batch)
+            if not data.get("has_next"):
+                break
+            page += 1
+        except Exception:
+            break
     return _dedup(urls)
 
 
@@ -202,13 +275,15 @@ def run(ctx, phase_num=3, total=9):
     results = {}
 
     sources = {
-        "wayback_cdx":   (fetch_wayback_cdx,   [domain,          ctx.timeout]),
-        "urlscan":       (fetch_urlscan,        [domain,          ctx.timeout]),
+        "wayback_cdx":   (fetch_wayback_cdx,   [domain, ctx.timeout]),
+        "commoncrawl":   (fetch_commoncrawl,    [domain, ctx.timeout]),
+        "otx":           (fetch_otx,            [domain, ctx.timeout]),
+        "urlscan":       (fetch_urlscan,        [domain, ctx.timeout]),
         "gau":           (run_tool,             [["gau", "--timeout", str(ctx.timeout),
                                                   "--retries", "2", domain], ctx.timeout]),
-        "waybackurls":   (run_tool,             [["waybackurls", domain],    ctx.timeout]),
+        "waybackurls":   (run_tool,             [["waybackurls", domain], ctx.timeout]),
         "waymore":       (run_tool,             [["waymore", "-i", domain, "-mode", "U",
-                                                  "-oU", "-"],               ctx.timeout]),
+                                                  "-oU", "-"], ctx.timeout]),
     }
     if mode == "full":
         sources["katana"] = (run_katana, [ctx.target_url, ctx.timeout])
@@ -229,12 +304,14 @@ def run(ctx, phase_num=3, total=9):
                 print(f"[urls]   {name:<15} → ERROR: {e}")
 
     ordered = [
-        results.get("wayback_cdx",   []),
-        results.get("urlscan",       []),
-        results.get("waymore",       []),
-        results.get("gau",           []),
-        results.get("waybackurls",   []),
-        results.get("katana",        []),
+        results.get("wayback_cdx",  []),
+        results.get("commoncrawl",  []),
+        results.get("otx",          []),
+        results.get("urlscan",      []),
+        results.get("waymore",      []),
+        results.get("gau",          []),
+        results.get("waybackurls",  []),
+        results.get("katana",       []),
         [r.get("resolved_url") or r["url"]
          for r in ctx.robots_live if r.get("status") == 200],
         getattr(ctx, "sitemap_urls", []),
@@ -260,8 +337,8 @@ def run(ctx, phase_num=3, total=9):
 
     ctx.url_pool = merged
     ctx.write_json("url_sources.json", {s: len(b) for s, b in results.items()})
-    ctx.write_text("all_urls.txt",        "\n".join(merged))
-    ctx.write_text("pre_uro_params.txt",  "\n".join(ctx.pre_uro_params))
+    ctx.write_text("all_urls.txt",       "\n".join(merged))
+    ctx.write_text("pre_uro_params.txt", "\n".join(ctx.pre_uro_params))
 
     ctx.phases_run.append("urls")
     ctx.log_phase_done(
