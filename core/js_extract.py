@@ -44,12 +44,19 @@ FIX 11  Correct regex syntax in 4 SECRET_PATTERNS entries where a bare "
          inside an r-string was terminating the string early, causing a
          SyntaxError at import time:
            aws_secret_key, twilio_auth_token, heroku_api_key, generic_secret
-         Changed ['\\\""] → ['"] (single or double quote character class).
+         Changed ['\""] → ['"] (single or double quote character class).
 
 FIX 12  Allow single-char HTTP params (q, s, p, t etc.).
          is_noise_param previously dropped any name with len < 2, which
          silently discarded the extremely common search param "q" and other
          single-letter params.  Changed guard to len < 1 (empty string only).
+
+FEATURE 3  Lazy-loaded chunk discovery.
+           Parse import("./chunk-XYZ.js") / import("/assets/app.js") style
+           calls from fetched JS files, resolve them relative to the current
+           JS file URL, keep only in-scope URLs, then process those chunk URLs
+           in one extra pass. Newly discovered chunk URLs are merged back into
+           ctx.js_files so output reflects the full discovered JS set.
 """
 
 import re, requests, json
@@ -141,6 +148,14 @@ ENDPOINT_PATTERNS = [
     re.compile(r"""['"`](/[a-zA-Z0-9_\-./]{3,80}\?[a-zA-Z0-9_\-=&%+.]{2,100})['"`]"""),
     re.compile(r"""['"`](https?://[^'"`\s]{10,200})['"`]"""),
     re.compile(r"""(?:path|route|url|href|src|action)\s*[:=]\s*['"`](/[^'"`\s]{2,80})['"`]"""),
+]
+
+# ── Lazy chunk patterns ──────────────────────────────────────────────────────
+LAZY_CHUNK_PATTERNS = [
+    re.compile(r'''\bimport\s*\(\s*(?:/\*.*?\*/\s*)*['\"]([^'\"]+\.js(?:\?[^'\"]*)?)['\"]\s*\)''', re.IGNORECASE | re.DOTALL),
+    re.compile(r'''\brequire\.ensure\s*\(.*?,\s*.*?,\s*['\"]([^'\"]+)['\"]\s*\)''', re.IGNORECASE | re.DOTALL),
+    re.compile(r'''['\"]([^'\"]*chunk[^'\"]*\.js(?:\?[^'\"]*)?)['\"]''', re.IGNORECASE),
+    re.compile(r'''['\"]([^'\"]*\/(?:static|assets|chunks?|js)\/[^'\"]+\.js(?:\?[^'\"]*)?)['\"]''', re.IGNORECASE),
 ]
 
 # ── Single-name parameter patterns ───────────────────────────────────────────
@@ -362,6 +377,25 @@ def _is_in_scope_endpoint(url: str, domain: str) -> bool:
         return False
 
 
+def _looks_like_chunk_path(path: str) -> bool:
+    if not path or "${" in path:
+        return False
+    lp = path.lower()
+    return (
+        lp.endswith(".js") and
+        (
+            "chunk" in lp or
+            "/static/" in lp or
+            "/assets/" in lp or
+            "/js/" in lp or
+            "/chunks/" in lp or
+            lp.startswith("./") or
+            lp.startswith("../") or
+            lp.startswith("/")
+        )
+    )
+
+
 # ── Core extraction ───────────────────────────────────────────────────────────
 
 def extract_endpoints(text, base_url, domain):
@@ -376,6 +410,19 @@ def extract_endpoints(text, base_url, domain):
             if _is_valid_endpoint(resolved) and _is_in_scope_endpoint(resolved, domain):
                 endpoints.add(resolved)
     return list(endpoints)
+
+
+def extract_lazy_chunks(text, current_js_url, domain):
+    chunks = set()
+    for pattern in LAZY_CHUNK_PATTERNS:
+        for m in pattern.finditer(text):
+            ref = m.group(1).strip()
+            if not _looks_like_chunk_path(ref):
+                continue
+            resolved = ref if ref.startswith("http") else urljoin(current_js_url, ref)
+            if _is_valid_endpoint(resolved) and _is_in_scope_endpoint(resolved, domain):
+                chunks.add(resolved)
+    return sorted(chunks)
 
 
 def extract_params(text):
@@ -425,6 +472,7 @@ def process_js_file(js_url, map_url, base_url, domain, timeout, ua):
         "endpoints": [],
         "params": [],
         "secrets": [],
+        "lazy_chunks": [],
         "source": "js",
     }
 
@@ -440,9 +488,10 @@ def process_js_file(js_url, map_url, base_url, domain, timeout, ua):
     if not text:
         return result
 
-    result["endpoints"] = extract_endpoints(text, base_url, domain)
-    result["params"]    = extract_params(text)
-    result["secrets"]   = extract_secrets(text, js_url)
+    result["endpoints"]   = extract_endpoints(text, base_url, domain)
+    result["params"]      = extract_params(text)
+    result["secrets"]     = extract_secrets(text, js_url)
+    result["lazy_chunks"] = extract_lazy_chunks(text, js_url, domain)
     return result
 
 
@@ -468,23 +517,61 @@ def run(ctx, phase_num=5, total=9):
     global_ep     = set()
     param_map     = {}
     all_secrets   = []
+    seen_js       = set(ctx.js_files)
+    lazy_chunks_total = set()
 
-    with ThreadPoolExecutor(max_workers=20) as ex:
-        futures = {
-            ex.submit(
-                process_js_file,
-                js_url,
-                ctx.source_maps.get(js_url),
-                base_url,
-                domain,
-                ctx.timeout,
-                ctx.user_agent,
-            ): js_url
-            for js_url in ctx.js_files
-        }
+    def _process_batch(js_urls):
+        batch_results = []
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            futures = {
+                ex.submit(
+                    process_js_file,
+                    js_url,
+                    ctx.source_maps.get(js_url),
+                    base_url,
+                    domain,
+                    ctx.timeout,
+                    ctx.user_agent,
+                ): js_url
+                for js_url in js_urls
+            }
 
-        for fut in as_completed(futures):
-            r = fut.result()
+            for fut in as_completed(futures):
+                r = fut.result()
+                batch_results.append(r)
+        return batch_results
+
+    # Pass 1: existing JS files
+    first_pass = _process_batch(ctx.js_files)
+
+    for r in first_pass:
+        all_results.append(r)
+        global_params.update(r["params"])
+        global_ep.update(r["endpoints"])
+        all_secrets.extend(r["secrets"])
+        lazy_chunks_total.update(r["lazy_chunks"])
+
+        for ep in r["endpoints"]:
+            param_map.setdefault(ep, set()).update(r["params"])
+
+        if not ctx.silent and (r["params"] or r["endpoints"] or r["lazy_chunks"]):
+            sec_lbl   = f"  ★ {len(r['secrets'])} secrets" if r["secrets"] else ""
+            chunk_lbl = f"  +{len(r['lazy_chunks'])} lazy chunks" if r["lazy_chunks"] else ""
+            ctx.log(
+                f"[js_extract]   {r['source']:12}  "
+                f"{len(r['params']):3} params  "
+                f"{len(r['endpoints']):3} endpoints{sec_lbl}{chunk_lbl}"
+                f"  {r['url']}"
+            )
+
+    # Pass 2: one-level lazy chunk expansion
+    new_chunks = [u for u in sorted(lazy_chunks_total) if u not in seen_js]
+    if new_chunks:
+        ctx.log(f"[js_extract] Processing {len(new_chunks)} lazy-loaded chunks (1-level deep)...")
+        second_pass = _process_batch(new_chunks)
+        seen_js.update(new_chunks)
+
+        for r in second_pass:
             all_results.append(r)
             global_params.update(r["params"])
             global_ep.update(r["endpoints"])
@@ -508,6 +595,7 @@ def run(ctx, phase_num=5, total=9):
     global_ep.update(inline_eps)
     global_params.update(inline_params)
 
+    ctx.js_files        = sorted(seen_js)
     ctx.js_global_params = sorted(global_params)
     ctx.js_endpoints     = sorted(global_ep)
     ctx.js_param_map     = {ep: sorted(p) for ep, p in param_map.items()}
@@ -527,6 +615,13 @@ def run(ctx, phase_num=5, total=9):
     })
     ctx.write_text("js_params_flat.txt",    "\n".join(ctx.js_global_params))
     ctx.write_text("js_endpoints_flat.txt", "\n".join(ctx.js_endpoints))
+    ctx.write_text("js_files.txt",          "\n".join(ctx.js_files))
+
+    if lazy_chunks_total:
+        ctx.write_json("lazy_chunks.json", {
+            "total": len(lazy_chunks_total),
+            "chunks": sorted(lazy_chunks_total),
+        })
 
     if all_secrets:
         ctx.write_json("js_secrets_hints.json", all_secrets)
@@ -542,6 +637,7 @@ def run(ctx, phase_num=5, total=9):
         f"{len(ctx.js_global_params)} params | "
         f"{len(high_value)} high-value | "
         f"{len(ctx.js_endpoints)} endpoints | "
-        f"{len(all_secrets)} secret hints",
+        f"{len(all_secrets)} secret hints | "
+        f"{len(lazy_chunks_total)} lazy chunks",
     )
     return ctx
