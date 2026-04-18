@@ -15,9 +15,19 @@ Skipped gracefully if xnLinkFinder is not installed.
 """
 
 import shutil, subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 from core.context import Context
 from core.urls import should_keep, _dedup
+
+MAX_SEEDS = 150
+MAX_WORKERS = 15
+
+HIGH_VALUE_KEYWORDS = [
+    "/api/", "/graphql", "/search", "/ajax", "/rest/",
+    "/v1/", "/v2/", "/v3/", "/user", "/account", "/admin",
+    "/query", "/data", "/fetch", "/get", "/post",
+]
 
 
 def _is_valid_endpoint(url: str) -> bool:
@@ -35,6 +45,17 @@ def _is_valid_endpoint(url: str) -> bool:
         return False
 
 
+def _prioritize(candidates: list) -> list:
+    """Put high-value API/search endpoints first so the cap keeps the best seeds."""
+    high, normal = [], []
+    for url in candidates:
+        if any(kw in url.lower() for kw in HIGH_VALUE_KEYWORDS):
+            high.append(url)
+        else:
+            normal.append(url)
+    return high + normal
+
+
 def _run_xnlinkfinder(url: str, timeout: int, ua: str) -> list:
     """Run xnLinkFinder against a single URL; return list of http(s) URLs."""
     try:
@@ -49,7 +70,7 @@ def _run_xnlinkfinder(url: str, timeout: int, ua: str) -> list:
             ],
             capture_output=True,
             text=True,
-            timeout=timeout * 4,
+            timeout=timeout * 3,
         )
         return [
             u.strip()
@@ -70,32 +91,45 @@ def run(ctx: Context, phase_num: int = 7, total: int = 10) -> Context:
     parsed = urlparse(ctx.target_url) if ctx.target_url else None
     domain = (parsed.netloc if parsed and parsed.netloc else ctx.target).lstrip("www.")
 
-    # Seed: deduplicated in-scope URLs from the full pool
-    seed_urls = _dedup([
+    # Build seed list: deduplicated, in-scope, high-value first
+    candidates = _dedup([
         u for u in (ctx.url_pool + ctx.js_endpoints)
         if _is_valid_endpoint(u) and should_keep(u, domain)
     ])
+    candidates = _prioritize(candidates)
+    seed_urls  = candidates[:MAX_SEEDS]
 
-    # Cap seeds to avoid extremely long crawl times
-    MAX_SEEDS = 80
-    if len(seed_urls) > MAX_SEEDS:
-        seed_urls = seed_urls[:MAX_SEEDS]
+    ctx.log(f"[crawl] xnLinkFinder crawling {len(seed_urls)} seed URLs "
+            f"({MAX_WORKERS} workers)...")
 
-    ctx.log(f"[crawl] xnLinkFinder crawling {len(seed_urls)} seed URLs...")
+    found    = []
+    pool_set = set(ctx.url_pool)
+    workers  = min(MAX_WORKERS, len(seed_urls))
 
-    found = []
-    for url in seed_urls:
-        batch = _run_xnlinkfinder(url, ctx.timeout, ctx.user_agent)
-        found.extend(batch)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {
+            ex.submit(_run_xnlinkfinder, url, ctx.timeout, ctx.user_agent): url
+            for url in seed_urls
+        }
+        done = 0
+        for fut in as_completed(futures):
+            url = futures[fut]
+            try:
+                batch = fut.result()
+                found.extend(batch)
+                done += 1
+                if batch and not ctx.silent:
+                    ctx.log(f"[crawl]   [{done}/{len(seed_urls)}] +{len(batch)} → {url}")
+            except Exception as e:
+                ctx.log(f"[crawl]   error on {url}: {e}")
 
-    # Validate + filter to in-scope only
+    # Filter to new, valid, in-scope URLs only
     new_urls = [
         u for u in _dedup(found)
-        if _is_valid_endpoint(u) and should_keep(u, domain)
-        and u not in set(ctx.url_pool)
+        if _is_valid_endpoint(u) and should_keep(u, domain) and u not in pool_set
     ]
 
-    ctx.log(f"[crawl] xnLinkFinder found {len(found)} raw URLs → {len(new_urls)} new in-scope")
+    ctx.log(f"[crawl] {len(found)} raw → {len(new_urls)} new in-scope URLs")
     ctx.url_pool = _dedup(ctx.url_pool + new_urls)
     ctx.write_text("crawl_urls.txt", "\n".join(new_urls))
 
