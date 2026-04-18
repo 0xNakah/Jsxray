@@ -49,7 +49,7 @@ def _fetch_root(target_url: str, timeout: int, headers: dict):
             body += chunk
             if len(body) >= _BODY_LIMIT:
                 break
-        r._content = body          # cache so r.text works normally
+        r._content = body
         r.encoding = r.encoding or "utf-8"
         return r, body.decode(r.encoding, errors="replace")
     except Exception:
@@ -62,7 +62,7 @@ def detect_canonical(response, target_url: str):
     Falls back to target_url if response is None.
     """
     if response is not None:
-        final  = response.url.rstrip("/")
+        final = response.url.rstrip("/")
         parsed = urlparse(final)
         canonical_base = f"{parsed.scheme}://{parsed.netloc}"
         return canonical_base, parsed.netloc
@@ -71,9 +71,9 @@ def detect_canonical(response, target_url: str):
 
 
 def fetch_robots(target_url: str, timeout: int, headers: dict):
-    parsed   = urlparse(target_url)
-    base     = f"{parsed.scheme}://{parsed.netloc}"
-    bare     = parsed.netloc.lstrip("www.")
+    parsed = urlparse(target_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    bare = parsed.netloc.lstrip("www.")
     www_base = f"{parsed.scheme}://www.{bare}"
 
     candidates = list(dict.fromkeys([base, www_base]))
@@ -92,10 +92,10 @@ def fetch_robots(target_url: str, timeout: int, headers: dict):
 
 
 def fetch_sitemap(target_url: str, timeout: int, headers: dict):
-    parsed   = urlparse(target_url)
-    base     = f"{parsed.scheme}://{parsed.netloc}"
+    parsed = urlparse(target_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
     www_base = f"{parsed.scheme}://www.{parsed.netloc.lstrip('www.')}"
-    urls     = []
+    urls = []
 
     for base_try in list(dict.fromkeys([base, www_base])):
         for sm_path in ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml"]:
@@ -129,19 +129,21 @@ def detect_tech_stack(response, body: str):
             tech.append(h[hdr])
 
     hints = {
-        "React":      ["__REACT_DEVTOOLS", "data-reactroot", "data-reactid"],
-        "Next.js":    ["__NEXT_DATA__", "_next/static"],
-        "Angular":    ["ng-version", "<app-root", "ng-app"],
-        "Vue.js":     ["__vue__", "data-v-", "<div id=\"app\""],
-        "WordPress":  ["wp-content", "wp-includes"],
-        "Drupal":     ["Drupal.settings", "/sites/default/files"],
+        "React": ["__REACT_DEVTOOLS", "data-reactroot", "data-reactid"],
+        "Next.js": ["__NEXT_DATA__", "_next/static"],
+        "Angular": ["ng-version", "<app-root", "ng-app"],
+        "Vue.js": ["__vue__", "data-v-", "<div id=\"app\""],
+        "WordPress": ["wp-content", "wp-includes"],
+        "Drupal": ["Drupal.settings", "/sites/default/files"],
         "Cloudflare": ["cf-ray", "__cf_bm", "cloudflare"],
-        "GraphQL":    ["/graphql", "__typename", "operationName"],
+        "GraphQL": ["/graphql", "__typename", "operationName"],
         "PerimeterX": ["_pxAppId", "px.js", "PerimeterX"],
-        "Akamai":     ["akamai", "akam/"],
+        "Akamai": ["akamai", "akam/"],
     }
+    body_lower = body.lower()
+    headers_text = str(h).lower()
     for name, sigs in hints.items():
-        if any(sig.lower() in body.lower() or sig.lower() in str(h) for sig in sigs):
+        if any(sig.lower() in body_lower or sig.lower() in headers_text for sig in sigs):
             tech.append(name)
 
     if "content-security-policy" in h:
@@ -162,10 +164,8 @@ def run(ctx: Context, phase_num=1, total=9) -> Context:
 
     headers = {**HEADERS, "User-Agent": ctx.user_agent}
 
-    # ── Single root fetch (reused for canonical + fingerprinting) ──────────────
     root_response, body_snippet = _fetch_root(ctx.target_url, ctx.timeout, headers)
 
-    # ── Canonical URL ──────────────────────────────────────────────────
     canonical_base, canonical_netloc = detect_canonical(root_response, ctx.target_url)
     if canonical_netloc != urlparse(ctx.target_url).netloc:
         ctx.log(f"[intake] Redirect    : {ctx.target_url} → {canonical_base}")
@@ -176,7 +176,6 @@ def run(ctx: Context, phase_num=1, total=9) -> Context:
     ctx.log(f"[intake] Domain     : {ctx.target}")
     ctx.log(f"[intake] Workspace  : {ctx.workspace}")
 
-    # ── Tech stack (no extra HTTP request) ─────────────────────────────
     tech, csp_missing = detect_tech_stack(root_response, body_snippet)
     if tech:
         ctx.tech_stack = tech
@@ -185,9 +184,22 @@ def run(ctx: Context, phase_num=1, total=9) -> Context:
     if csp_missing:
         ctx.log("[intake] CSP        : missing")
 
-    # ── robots.txt ────────────────────────────────────────────────────────────
     raw, robots_url = fetch_robots(ctx.target_url, ctx.timeout, headers)
     if raw:
         ctx.robots_raw = raw
         ctx.write_text("robots_raw.txt", raw)
-        ctx.log(
+        ctx.log(f"[intake] robots.txt : {robots_url}")
+
+    sitemap_urls = fetch_sitemap(ctx.target_url, ctx.timeout, headers)
+    if sitemap_urls:
+        ctx.sitemap_urls = sitemap_urls
+        ctx.write_json("sitemap_urls.json", sitemap_urls)
+        ctx.log(f"[intake] Sitemap    : {len(sitemap_urls)} URLs")
+
+    ctx.log_phase_done(
+        phase_num,
+        total,
+        "intake",
+        f"tech={len(getattr(ctx, 'tech_stack', []))}, sitemap={len(getattr(ctx, 'sitemap_urls', []))}, robots={'yes' if bool(getattr(ctx, 'robots_raw', '')) else 'no'}"
+    )
+    return ctx
