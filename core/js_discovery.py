@@ -31,7 +31,8 @@ from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from core.context import Context
 from core.urls import is_blocked
-from core.js_extract import extract_endpoints, extract_params
+from core.js_extract import extract_endpoints
+from core.ast_extract import extract_params
 
 SCRIPT_SRC    = re.compile(r'<script[^>]+src=["\']([^"\']+\.js[^"\']*)["\']', re.IGNORECASE)
 SCRIPT_INLINE = re.compile(r'<script(?![^>]*\bsrc\s*=)[^>]*>([\s\S]*?)</script>', re.IGNORECASE)
@@ -69,8 +70,6 @@ _MAP_VALID_CT = ("application/json", "text/plain", "application/octet-stream",
                  "application/javascript", "text/javascript")
 
 # Minimum inline block size worth processing.
-# 40 was too aggressive — short but valid calls like fetch("/api/x?q=1") are 38 chars.
-# 20 filters truly empty/whitespace-only blocks while keeping all real JS.
 _INLINE_MIN_CHARS = 20
 
 
@@ -100,10 +99,7 @@ def _prioritize_pages(urls):
 
 
 def fetch_page_js_refs(url, timeout, ua, domain):
-    """Fetch a page and return (script_src_refs, inline_blocks, was_blocked).
-
-    inline_blocks is a list of non-empty inline <script> text bodies.
-    """
+    """Fetch a page and return (script_src_refs, inline_blocks, was_blocked)."""
     try:
         r = requests.get(url, timeout=timeout,
                          headers={**HEADERS, "User-Agent": ua},
@@ -124,14 +120,7 @@ def fetch_page_js_refs(url, timeout, ua, domain):
 
 
 def check_source_map(js_url, timeout, ua):
-    """Return the source map URL for js_url, or None if no valid map exists.
-
-    Priority:
-      1. SourceMap / X-SourceMap response header on the JS file itself
-      2. //# sourceMappingURL= comment in the last 800 chars of the JS body
-      3. Probe <js_url>.map with a GET — validate Content-Type is JSON/text
-         to reject SPA HTML shells that return 200 for every URL
-    """
+    """Return the source map URL for js_url, or None if no valid map exists."""
     try:
         r = requests.get(js_url, timeout=timeout,
                          headers={**HEADERS, "User-Agent": ua},
@@ -260,7 +249,6 @@ def run(ctx: Context, phase_num=4, total=9) -> Context:
             for ref in refs:
                 js_refs.add(_resolve(ref, page_url))
 
-            # Feature #2 — process inline <script> blocks immediately
             if inlines:
                 inline_blocks_total += len(inlines)
                 combined = "\n".join(inlines)
@@ -274,72 +262,86 @@ def run(ctx: Context, phase_num=4, total=9) -> Context:
         + (f" ({blocked} blocked)" if blocked else "")
     )
     ctx.log(
-        f"[js_discovery]   Inline <script> blocks: {inline_blocks_total} across pages →"
-        f" {len(all_inline_eps)} endpoints, {len(all_inline_pars)} params"
+        f"[js_discovery]   Inline <script> blocks: {inline_blocks_total} across pages"
+        f" → {len(all_inline_eps)} endpoints, {len(all_inline_pars)} params"
     )
 
-    wayback_js = seed_js_from_wayback(domain, ctx.timeout, ctx)
-    js_refs.update(wayback_js)
-
-    if mode in ("standard", "full"):
-        ctx.log("[js_discovery] Probing common chunk patterns...")
-        chunk_js = try_chunk_patterns(base_url, tech_stack, ctx.timeout, ctx.user_agent)
-        ctx.log(f"[js_discovery]   Chunk patterns → {len(chunk_js)} found")
-        js_refs.update(chunk_js)
-
-    pool_js = [u for u in ctx.url_pool if _is_js_url(u)]
-    ctx.log(f"[js_discovery]   url_pool .js drain → {len(pool_js)} URLs")
-    js_refs.update(pool_js)
-
-    in_scope = []
-    for url in js_refs:
-        try:
-            host = urlparse(url).netloc
-            if _host_in_scope(host, domain):
-                in_scope.append(url)
-        except Exception:
-            pass
-
-    in_scope = list(dict.fromkeys(in_scope))
-    ctx.log(f"[js_discovery]   In-scope JS files: {len(in_scope)}")
-
-    ctx.log(f"[js_discovery] Checking {len(in_scope)} JS files for source maps...")
-    source_maps = {}
-
-    with ThreadPoolExecutor(max_workers=20) as ex:
-        futures = {
-            ex.submit(check_source_map, url, ctx.timeout, ctx.user_agent): url
-            for url in in_scope
-        }
-        for f in as_completed(futures):
-            js_url  = futures[f]
-            map_url = f.result()
-            if map_url:
-                source_maps[js_url] = map_url
-                ctx.log(f"[js_discovery]   ★ SOURCE MAP  {js_url}")
-
-    ctx.js_files    = in_scope
-    ctx.source_maps = source_maps
-
-    # Store inline results on context so js_extract can merge them
     ctx.inline_script_endpoints = sorted(all_inline_eps)
     ctx.inline_script_params    = sorted(all_inline_pars)
 
-    ctx.write_text("js_files.txt", "\n".join(in_scope))
-    if source_maps:
-        ctx.write_json("source_maps.json",
-                       [{"js": k, "map": v} for k, v in source_maps.items()])
-    if ctx.inline_script_endpoints or ctx.inline_script_params:
-        ctx.write_json("inline_scripts.json", {
-            "endpoints": ctx.inline_script_endpoints,
-            "params":    ctx.inline_script_params,
-        })
+    # Pool-resident JS URLs
+    pool_js = [u for u in ctx.url_pool if _is_js_url(u)]
+    ctx.log(f"[js_discovery]   JS from url_pool: {len(pool_js)}")
+    js_refs.update(pool_js)
+
+    # Filter to in-scope only
+    js_refs = {u for u in js_refs if _host_in_scope(urlparse(u).netloc, domain)}
+
+    # Wayback CDX passive seed (all modes)
+    wayback_js = seed_js_from_wayback(domain, ctx.timeout, ctx)
+    js_refs.update(wayback_js)
+
+    # Standard / full: chunk pattern probe + cross-origin JS host crawl
+    if mode in ("standard", "full"):
+        chunk_found = try_chunk_patterns(base_url, tech_stack, ctx.timeout, ctx.user_agent)
+        if chunk_found:
+            ctx.log(f"[js_discovery]   Chunk patterns hit: {len(chunk_found)}")
+            js_refs.update(chunk_found)
+
+        # Cross-origin JS host crawl
+        cross_origin_hosts = set()
+        for u in list(js_refs):
+            host = urlparse(u).netloc
+            if host and not _host_in_scope(host, domain):
+                cross_origin_hosts.add(host)
+
+        if cross_origin_hosts and mode == "full":
+            ctx.log(f"[js_discovery]   Cross-origin JS hosts: {', '.join(list(cross_origin_hosts)[:5])}")
+            extra_refs = set()
+            for host in list(cross_origin_hosts)[:3]:
+                co_url = f"https://{host}/"
+                refs, _, _ = fetch_page_js_refs(co_url, ctx.timeout, ctx.user_agent, host)
+                for ref in refs:
+                    extra_refs.add(_resolve(ref, co_url))
+            ctx.log(f"[js_discovery]   Cross-origin extra JS: {len(extra_refs)}")
+            js_refs.update(extra_refs)
+
+    ctx.log(f"[js_discovery]   Total unique JS refs: {len(js_refs)}")
+
+    # Source map discovery (threaded)
+    source_maps = {}
+    js_list     = sorted(js_refs)
+
+    ctx.log(f"[js_discovery] Checking source maps for {len(js_list)} JS files...")
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        sm_futures = {
+            ex.submit(check_source_map, js_url, ctx.timeout, ctx.user_agent): js_url
+            for js_url in js_list
+        }
+        for f in as_completed(sm_futures):
+            js_url = sm_futures[f]
+            sm_url = f.result()
+            if sm_url:
+                source_maps[js_url] = sm_url
+
+    ctx.log(f"[js_discovery]   Source maps found: {len(source_maps)}")
+
+    ctx.js_files    = js_list
+    ctx.source_maps = source_maps
+
+    ctx.write_text("js_files.txt",    "\n".join(js_list))
+    ctx.write_json("source_maps.json", source_maps)
+    if ctx.inline_script_endpoints:
+        ctx.write_text("inline_endpoints.txt", "\n".join(ctx.inline_script_endpoints))
+    if ctx.inline_script_params:
+        ctx.write_text("inline_params.txt", "\n".join(ctx.inline_script_params))
 
     ctx.phases_run.append("js_discovery")
-    ctx.log_phase_done(phase_num, total, "js_discovery",
-        f"{len(in_scope)} JS files | {len(source_maps)} source maps | "
-        f"{len(wayback_js)} from Wayback | {len(pool_js)} from url_pool | "
-        f"{inline_blocks_total} inline blocks | "
-        f"{len(ctx.inline_script_endpoints)} inline endpoints | "
-        f"{len(ctx.inline_script_params)} inline params")
+    ctx.log_phase_done(
+        phase_num, total, "js_discovery",
+        f"{len(js_list)} JS files | "
+        f"{len(source_maps)} source maps | "
+        f"{len(all_inline_eps)} inline endpoints | "
+        f"{len(all_inline_pars)} inline params",
+    )
     return ctx
