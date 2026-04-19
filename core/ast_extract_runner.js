@@ -5,12 +5,30 @@
  *   { params: [{value, confidence, source}], endpoints: [], error: null }
  *
  * Requires: acorn, acorn-walk  (npm install -g acorn acorn-walk)
+ * Optional: @babel/parser     (npm install -g @babel/parser)
+ *           Enables TypeScript, JSX, and error-recovery on minified bundles.
+ *
+ * Blind-spot fixes (v5.1):
+ *   - Object.assign({}, { key: val }) param extraction
+ *   - Spread object literal keys: fetch('/a', { ...opts, body: { secret: x } })
+ *   - React useState initial object keys
+ *   - Vue this.$http / this.$axios call detection
+ *   - Dynamic computed string keys via string-constant folding
+ *   - @babel/parser fallback for TS/JSX/minified parse failures
+ *   - isValidParam floor raised to 2 chars (with q/s/v/t/id whitelist)
  */
 
 'use strict';
 
+// ── Parser setup: acorn primary, babel fallback ───────────────────────────────
+
 const acorn = require('acorn');
-const walk = require('acorn-walk');
+const walk  = require('acorn-walk');
+
+let babelParser = null;
+try { babelParser = require('@babel/parser'); } catch (_) {}
+
+// ── Constants ─────────────────────────────────────────────────────────────────
 
 const NET_CALLS = new Set([
   'fetch',
@@ -20,6 +38,9 @@ const NET_CALLS = new Set([
   'superagent', 'request',
   'http.get', 'http.post', 'https.get', 'https.post',
   '$.get', '$.post', '$.ajax',
+  // Vue instance methods
+  'this.$http.get', 'this.$http.post', 'this.$http.put', 'this.$http.delete',
+  'this.$axios.get', 'this.$axios.post', 'this.$axios.put', 'this.$axios.delete',
 ]);
 
 const FETCH_OPTION_KEYS = new Set([
@@ -35,10 +56,16 @@ const FETCH_OPTION_KEYS = new Set([
 
 const QUERY_MEMBER_ROOTS = /^(?:req|request|ctx|context)$/;
 const QUERY_MEMBER_PROPS = /^(?:query|body|params|searchParams)$/;
-const QUERY_SEED_NAMES = /^(?:params|searchParams|query|urlParams|queryParams|searchparams|querystring)$/i;
-const QUERY_INIT_PROPS = /^(?:query|params|searchParams|body)$/i;
-const PARAM_PROP_ROOTS = /^(?:params|query|qs|searchParams|queryParams|urlParams|args|opts)$/i;
-const PAYLOAD_ROOTS = /^(?:payload|body|formBody|requestBody|postData|formValues|formFields)$/i;
+const QUERY_SEED_NAMES   = /^(?:params|searchParams|query|urlParams|queryParams|searchparams|querystring)$/i;
+const QUERY_INIT_PROPS   = /^(?:query|params|searchParams|body)$/i;
+const PARAM_PROP_ROOTS   = /^(?:params|query|qs|searchParams|queryParams|urlParams|args|opts)$/i;
+const PAYLOAD_ROOTS      = /^(?:payload|body|formBody|requestBody|postData|formValues|formFields)$/i;
+
+// React hooks that accept an initial-state object whose keys are param names
+const REACT_STATE_HOOKS = new Set(['useState', 'useReducer', 'useFormik', 'useForm']);
+
+// Single-char params that are genuinely common and should pass the length floor
+const SINGLE_CHAR_WHITELIST = new Set(['q', 's', 'v', 't', 'p', 'n', 'id']);
 
 const JS_BUILTINS = new Set([
   'appendChild', 'removeChild', 'replaceChild', 'insertBefore', 'cloneNode',
@@ -83,11 +110,16 @@ const JS_BUILTINS = new Set([
   'get', 'set', 'has', 'delete', 'getAll', 'append',
 ]);
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
 function calleeName(node) {
   if (!node) return null;
   if (node.type === 'Identifier') return node.name;
-  if (node.type === 'MemberExpression' && node.object.type === 'Identifier' && node.property.type === 'Identifier') {
-    return node.object.name + '.' + node.property.name;
+  if (node.type === 'MemberExpression') {
+    // handles: axios.get, this.$http.post, etc.
+    const obj  = calleeName(node.object);
+    const prop = node.property?.type === 'Identifier' ? node.property.name : null;
+    if (obj && prop) return obj + '.' + prop;
   }
   return null;
 }
@@ -102,49 +134,109 @@ function extractQS(urlStr) {
   }
 }
 
+/**
+ * Collect all string-literal keys from an ObjectExpression,
+ * including one level of SpreadElement if the spread target is itself
+ * an ObjectExpression literal (handles { ...defaults, key: val }).
+ */
 function objectLiteralKeys(objNode) {
   if (!objNode || objNode.type !== 'ObjectExpression') return [];
-  return objNode.properties
-    .filter(p => p.type !== 'SpreadElement' && p.key)
-    .map(p => p.key.name || p.key.value)
-    .filter(Boolean);
+  const keys = [];
+  for (const prop of objNode.properties) {
+    if (prop.type === 'SpreadElement') {
+      // Unwrap one level: { ...{ a: 1, b: 2 } }
+      if (prop.argument?.type === 'ObjectExpression') {
+        keys.push(...objectLiteralKeys(prop.argument));
+      }
+      continue;
+    }
+    if (!prop.key) continue;
+    const k = prop.key.name || prop.key.value;
+    if (k) keys.push(k);
+  }
+  return keys;
 }
 
+/**
+ * Attempt to fold a node to a static string constant.
+ * Covers: Literal, Identifier whose name matches known string vars (best-effort).
+ */
+function foldToString(node, stringConsts) {
+  if (!node) return null;
+  if (node.type === 'Literal' && typeof node.value === 'string') return node.value;
+  if (node.type === 'Identifier' && stringConsts.has(node.name)) return stringConsts.get(node.name);
+  return null;
+}
+
+/**
+ * isValidParam — raised floor to 2 chars with a small whitelist for
+ * common single-char params (q, s, v, t, p, n, id).
+ */
 function isValidParam(name) {
   if (!name || typeof name !== 'string') return false;
-  if (name.length < 1 || name.length > 60) return false;
+  if (name.length > 60) return false;
+  if (name.length === 1 && !SINGLE_CHAR_WHITELIST.has(name)) return false;
+  if (name.length < 1) return false;
   if (!/^[a-zA-Z][a-zA-Z0-9_\-]*$/.test(name)) return false;
   if (JS_BUILTINS.has(name)) return false;
   if (FETCH_OPTION_KEYS.has(name)) return false;
   return true;
 }
 
+// ── Parser: acorn first, babel fallback ──────────────────────────────────────
+
 function tryParse(code) {
+  // Primary: acorn — fast, zero overhead
   for (const sourceType of ['module', 'script']) {
     try {
       return acorn.parse(code, { ecmaVersion: 2022, sourceType });
     } catch (_) {}
   }
+  // Fallback: @babel/parser — handles TypeScript, JSX, decorators,
+  // and errorRecovery keeps going on minified/partial code
+  if (babelParser) {
+    try {
+      return babelParser.parse(code, {
+        sourceType: 'unambiguous',
+        plugins: ['typescript', 'jsx', 'decorators-legacy'],
+        errorRecovery: true,
+      });
+    } catch (_) {}
+  }
   return null;
 }
 
+// ── Pass 1: build alias maps + collect string constants ───────────────────────
+
 function buildAliasMap(ast) {
-  const queryAliases = new Set();
+  const queryAliases    = new Set();
   const urlParamAliases = new Set();
-  const payloadAliases = new Set();
-  const directParams = new Set();
+  const payloadAliases  = new Set();
+  const directParams    = new Set();
+  // Map of variable name → literal string value (for dynamic key folding)
+  const stringConsts    = new Map();
 
   walk.simple(ast, {
     VariableDeclarator(node) {
       if (!node.init) return;
       const init = node.init;
+
+      // Collect string constants: const KEY = 'api_token'
+      if (
+        node.id?.type === 'Identifier' &&
+        init.type === 'Literal' &&
+        typeof init.value === 'string'
+      ) {
+        stringConsts.set(node.id.name, init.value);
+      }
+
       const isReqMember = (
         init.type === 'MemberExpression' && !init.computed &&
         QUERY_MEMBER_ROOTS.test(init.object?.name || '') &&
         QUERY_MEMBER_PROPS.test(init.property?.name || '')
       );
-      const isQueryIdent = init.type === 'Identifier' && QUERY_SEED_NAMES.test(init.name);
-      const isMemberProp = (
+      const isQueryIdent  = init.type === 'Identifier' && QUERY_SEED_NAMES.test(init.name);
+      const isMemberProp  = (
         init.type === 'MemberExpression' && !init.computed &&
         QUERY_INIT_PROPS.test(init.property?.name || '')
       );
@@ -154,14 +246,15 @@ function buildAliasMap(ast) {
         init.callee.name === 'URLSearchParams'
       );
       const isPayload = init.type === 'Identifier' && PAYLOAD_ROOTS.test(init.name);
-      const isQuery = isReqMember || isQueryIdent || isMemberProp;
+      const isQuery   = isReqMember || isQueryIdent || isMemberProp;
 
       if (node.id.type === 'Identifier') {
-        if (isQuery) queryAliases.add(node.id.name);
-        if (isURLSP) urlParamAliases.add(node.id.name);
+        if (isQuery)   queryAliases.add(node.id.name);
+        if (isURLSP)   urlParamAliases.add(node.id.name);
         if (isPayload) payloadAliases.add(node.id.name);
       }
 
+      // Destructure: const { user_id, token } = req.query
       if (node.id.type === 'ObjectPattern' && isQuery) {
         for (const prop of node.id.properties) {
           if (prop.type === 'RestElement') continue;
@@ -169,27 +262,44 @@ function buildAliasMap(ast) {
           if (key) directParams.add(key);
         }
       }
+
+      // Object.assign alias: const p = Object.assign({}, someQueryObj)
+      if (
+        node.id?.type === 'Identifier' &&
+        init.type === 'CallExpression' &&
+        calleeName(init.callee) === 'Object.assign'
+      ) {
+        for (const arg of init.arguments) {
+          if (arg.type === 'Identifier' && queryAliases.has(arg.name)) {
+            queryAliases.add(node.id.name);
+            break;
+          }
+        }
+      }
     },
   });
 
-  return { queryAliases, urlParamAliases, payloadAliases, directParams };
+  return { queryAliases, urlParamAliases, payloadAliases, directParams, stringConsts };
 }
+
+// ── Pass 2: extract params ────────────────────────────────────────────────────
 
 function extract(code) {
   const ast = tryParse(code);
   if (!ast) return { params: [], endpoints: [], error: 'parse_failed' };
 
-  const { queryAliases, urlParamAliases, payloadAliases, directParams } = buildAliasMap(ast);
+  const { queryAliases, urlParamAliases, payloadAliases, directParams, stringConsts } =
+    buildAliasMap(ast);
 
   const callSitePositions = new Set();
   walk.simple(ast, {
     CallExpression(n) { callSitePositions.add(n.callee.start); },
   });
 
-  const found = [];
-  const seen = new Set();
-  const endpoints = [];
-  const seenEP = new Set();
+  const found    = [];
+  const seen     = new Set();
+  const endpoints  = [];
+  const seenEP   = new Set();
 
   function emit(value, confidence, source) {
     if (!isValidParam(value)) return;
@@ -205,13 +315,43 @@ function extract(code) {
     }
   }
 
+  /**
+   * Extract keys from an ObjectExpression that lives inside a net call body,
+   * including nested spread: fetch('/a', { ...opts, body: { secret: x } })
+   */
+  function extractObjectArgKeys(objNode, source, confidence) {
+    if (!objNode || objNode.type !== 'ObjectExpression') return;
+    for (const prop of objNode.properties) {
+      if (prop.type === 'SpreadElement') {
+        // Unwrap one level of spread object
+        if (prop.argument?.type === 'ObjectExpression') {
+          extractObjectArgKeys(prop.argument, source + '_spread', confidence);
+        }
+        continue;
+      }
+      if (!prop.key) continue;
+      const k = prop.key.name || prop.key.value;
+      if (!k) continue;
+      // Recurse into body/data/params sub-objects
+      if (['params', 'data', 'body'].includes(k) && prop.value?.type === 'ObjectExpression') {
+        for (const pk of objectLiteralKeys(prop.value)) emit(pk, 'HIGH', source + '_body');
+      } else if (!FETCH_OPTION_KEYS.has(k)) {
+        emit(k, confidence, source);
+      }
+      if (k === 'url' && prop.value?.type === 'Literal') emitEndpoint(prop.value.value);
+    }
+  }
+
   const SP_METHODS = new Set(['get', 'set', 'append', 'has', 'delete', 'getAll']);
 
   walk.simple(ast, {
+
+    // ── CallExpression handler ──────────────────────────────────────────────
     CallExpression(node) {
       const name = calleeName(node.callee);
       const args = node.arguments;
 
+      // ── Net calls: fetch, axios.*, got, ky, Vue this.$http.* ──────────────
       if (name && NET_CALLS.has(name) && args.length) {
         const first = args[0];
 
@@ -229,85 +369,168 @@ function extract(code) {
           }
         }
 
+        // All object args (options, body, config)
         for (const arg of args) {
-          if (arg.type !== 'ObjectExpression') continue;
-          for (const prop of arg.properties) {
-            if (prop.type === 'SpreadElement' || !prop.key) continue;
-            const k = prop.key.name || prop.key.value;
-            if (k === 'url' && prop.value?.type === 'Literal') emitEndpoint(prop.value.value);
-            if (['params', 'data'].includes(k) && prop.value?.type === 'ObjectExpression') {
-              for (const pk of objectLiteralKeys(prop.value)) emit(pk, 'HIGH', `axios_${k}`);
-            }
-          }
-        }
-
-        if (args.length >= 2 && args[1]?.type === 'ObjectExpression') {
-          const keys = objectLiteralKeys(args[1]);
-          if (keys.length && keys.every(k => !FETCH_OPTION_KEYS.has(k))) {
-            for (const k of keys) emit(k, 'HIGH', 'net_body_obj');
-          }
+          extractObjectArgKeys(arg, 'net_arg', 'HIGH');
         }
       }
 
+      // ── Object.assign({}, { key: val, ... }) ──────────────────────────────
+      if (name === 'Object.assign') {
+        for (const arg of args) {
+          if (arg.type !== 'ObjectExpression') continue;
+          for (const k of objectLiteralKeys(arg)) emit(k, 'MED', 'object_assign');
+        }
+      }
+
+      // ── React useState / useReducer / useForm initial state ───────────────
+      if (
+        node.callee.type === 'Identifier' &&
+        REACT_STATE_HOOKS.has(node.callee.name) &&
+        args[0]?.type === 'ObjectExpression'
+      ) {
+        for (const k of objectLiteralKeys(args[0])) emit(k, 'MED', 'react_state');
+      }
+
       if (node.callee.type === 'MemberExpression') {
-        const method = node.callee.property?.name;
+        const method  = node.callee.property?.name;
         const objNode = node.callee.object;
         const objName = objNode?.type === 'Identifier' ? objNode.name : null;
 
-        const isSP = objName && (QUERY_SEED_NAMES.test(objName) || urlParamAliases.has(objName));
-        const isSPNew = objNode?.type === 'NewExpression';
+        const isSP     = objName && (QUERY_SEED_NAMES.test(objName) || urlParamAliases.has(objName));
+        const isSPNew  = objNode?.type === 'NewExpression';
         const isQAlias = objName && queryAliases.has(objName);
 
-        if ((isSP || isSPNew || isQAlias) && method && SP_METHODS.has(method) &&
-            args[0]?.type === 'Literal' && typeof args[0].value === 'string') {
-          emit(args[0].value, 'HIGH', 'searchparam_call');
+        // URLSearchParams / alias .set/.append/.get
+        if ((isSP || isSPNew || isQAlias) && method && SP_METHODS.has(method)) {
+          // Static literal key
+          if (args[0]?.type === 'Literal' && typeof args[0].value === 'string') {
+            emit(args[0].value, 'HIGH', 'searchparam_call');
+          }
+          // Dynamic key: const key = 'api_token'; sp.set(key, val)
+          if (args[0]?.type === 'Identifier') {
+            const folded = foldToString(args[0], stringConsts);
+            if (folded) emit(folded, 'MED', 'searchparam_dynamic');
+          }
         }
 
-        if (method === 'append' && objName && /^(?:form|fd|formData|body|payload)$/i.test(objName) &&
-            args[0]?.type === 'Literal' && typeof args[0].value === 'string') {
-          emit(args[0].value, 'HIGH', 'formdata_append');
+        // FormData.append('field', val)
+        if (
+          method === 'append' &&
+          objName && /^(?:form|fd|formData|body|payload)$/i.test(objName)
+        ) {
+          if (args[0]?.type === 'Literal' && typeof args[0].value === 'string') {
+            emit(args[0].value, 'HIGH', 'formdata_append');
+          }
+          if (args[0]?.type === 'Identifier') {
+            const folded = foldToString(args[0], stringConsts);
+            if (folded) emit(folded, 'MED', 'formdata_dynamic');
+          }
         }
 
-        if (objNode?.type === 'Identifier' && objNode.name === 'JSON' && method === 'stringify' &&
-            args[0]?.type === 'ObjectExpression') {
-          for (const k of objectLiteralKeys(args[0])) emit(k, 'HIGH', 'json_stringify');
+        // JSON.stringify({ key: val })
+        if (objNode?.type === 'Identifier' && objNode.name === 'JSON' && method === 'stringify') {
+          if (args[0]?.type === 'ObjectExpression') {
+            for (const k of objectLiteralKeys(args[0])) emit(k, 'HIGH', 'json_stringify');
+          }
         }
 
-        if (objNode?.type === 'Identifier' && ['qs', 'querystring'].includes(objNode.name) &&
-            method === 'stringify' && args[0]?.type === 'ObjectExpression') {
+        // qs.stringify({ key: val }) / querystring.stringify(...)
+        if (
+          objNode?.type === 'Identifier' &&
+          ['qs', 'querystring'].includes(objNode.name) &&
+          method === 'stringify' &&
+          args[0]?.type === 'ObjectExpression'
+        ) {
           for (const k of objectLiteralKeys(args[0])) emit(k, 'HIGH', 'qs_stringify');
+        }
+
+        // Vue: this.$set(this.form, 'field', val)
+        if (
+          method === '$set' &&
+          args.length >= 2 &&
+          args[1]?.type === 'Literal' &&
+          typeof args[1].value === 'string'
+        ) {
+          emit(args[1].value, 'MED', 'vue_set');
         }
       }
     },
 
+    // ── MemberExpression handler ────────────────────────────────────────────
     MemberExpression(node) {
       const propName = node.computed
-        ? (node.property?.type === 'Literal' ? node.property.value : null)
+        ? (
+            node.property?.type === 'Literal'
+              ? node.property.value
+              // Dynamic computed: params[keyVar] — attempt constant fold
+              : foldToString(node.property, stringConsts)
+          )
         : node.property?.name;
 
       if (!propName || typeof propName !== 'string') return;
       if (callSitePositions.has(node.start)) return;
 
+      // req.query.user_id / req.body.token
       if (!node.computed && node.object?.type === 'MemberExpression' && !node.object.computed) {
         const root = node.object.object;
-        const mid = node.object.property;
-        if (root?.type === 'Identifier' && QUERY_MEMBER_ROOTS.test(root.name) && QUERY_MEMBER_PROPS.test(mid?.name)) {
+        const mid  = node.object.property;
+        if (
+          root?.type === 'Identifier' &&
+          QUERY_MEMBER_ROOTS.test(root.name) &&
+          QUERY_MEMBER_PROPS.test(mid?.name)
+        ) {
           return emit(propName, 'HIGH', 'req_member_read');
         }
       }
 
       if (!node.computed && node.object?.type === 'Identifier') {
         const objName = node.object.name;
-        if (queryAliases.has(objName)) return emit(propName, 'HIGH', 'alias_member_read');
+        if (queryAliases.has(objName))   return emit(propName, 'HIGH', 'alias_member_read');
         if (payloadAliases.has(objName)) return emit(propName, 'HIGH', 'payload_member_read');
         if (PARAM_PROP_ROOTS.test(objName)) return emit(propName, 'HIGH', 'param_prop_read');
       }
 
-      if (node.computed && node.property?.type === 'Literal' && node.object?.type === 'Identifier' &&
-          /^(?:body|payload|data|form|req)$/i.test(node.object.name)) {
+      // body['api_key'] — computed bracket read
+      if (
+        node.computed &&
+        node.object?.type === 'Identifier' &&
+        /^(?:body|payload|data|form|req)$/i.test(node.object.name)
+      ) {
         return emit(propName, 'HIGH', 'body_bracket_read');
       }
+
+      // params[keyVar] where keyVar was folded to a string constant
+      if (
+        node.computed &&
+        node.object?.type === 'Identifier' &&
+        PARAM_PROP_ROOTS.test(node.object.name)
+      ) {
+        return emit(propName, 'MED', 'param_dynamic_key');
+      }
     },
+
+    // ── AssignmentExpression: params['key'] = val ───────────────────────────
+    AssignmentExpression(node) {
+      const left = node.left;
+      if (left?.type !== 'MemberExpression') return;
+      if (!left.computed) return;
+
+      const objName = left.object?.type === 'Identifier' ? left.object.name : null;
+      if (!objName) return;
+
+      const keyStr = foldToString(left.property, stringConsts);
+      if (!keyStr) return;
+
+      if (
+        queryAliases.has(objName) ||
+        PARAM_PROP_ROOTS.test(objName) ||
+        /^(?:body|payload|data|form|req)$/i.test(objName)
+      ) {
+        emit(keyStr, 'MED', 'assignment_bracket');
+      }
+    },
+
   });
 
   for (const p of directParams) emit(p, 'HIGH', 'destructure');
@@ -317,12 +540,15 @@ function extract(code) {
     endpoints,
     error: null,
     meta: {
-      queryAliases: [...queryAliases],
+      queryAliases:    [...queryAliases],
       urlParamAliases: [...urlParamAliases],
-      payloadAliases: [...payloadAliases],
+      payloadAliases:  [...payloadAliases],
+      babelFallback:   babelParser !== null,
     },
   };
 }
+
+// ── Entry point ───────────────────────────────────────────────────────────────
 
 let input = '';
 process.stdin.setEncoding('utf8');
