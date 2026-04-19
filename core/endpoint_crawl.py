@@ -16,17 +16,17 @@ Strategy
 
 3.  Per response type:
       HTML  → BeautifulSoup (if available) or regex fallback
-              • <input name>, <select name>, <textarea name>   → params
+              • <input name>, <select name>, <textarea name>   → params (via AST on inline scripts)
               • <a href="?foo=bar">                            → params (query keys)
               • <form action="/path">                          → endpoints
               • <script src="/js/app.js">                      → new JS URLs → extra_js pass
               • inline <script> text                           → extract_endpoints + extract_params
-      JSON  → walk all keys recursively                        → params
-              walk all string values that look like paths/URLs → endpoints
+      JSON  → walk all string values that look like paths/URLs → endpoints
+              walk all text content through extract_params      → params
       JS    → extract_endpoints + extract_params (same as js_extract)
 
 4.  All newly found endpoints are filtered through _is_in_scope_endpoint.
-    All newly found params are filtered through is_noise_param.
+    All param extraction uses ast_extract.extract_params.
 
 5.  Extra JS pass (FIX):
       Any <script src> URLs discovered in HTML responses are run through
@@ -51,18 +51,17 @@ import requests
 from urllib.parse import urljoin, urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from core.ast_extract import extract_params
 from core.js_extract import (
     extract_endpoints,
-    extract_params,
-    is_noise_param,
     _is_in_scope_endpoint,
     _host_in_scope,
     process_js_file,
     HEADERS,
 )
 
-# ── Static asset extensions to skip ──────────────────────────────────────────
-_SKIP_EXT = re.compile(
+# ── Static asset extensions to skip ─────────────────────────────────────────────
+SKIP_EXT = re.compile(
     r"\.(?:png|jpg|jpeg|gif|webp|svg|ico|bmp|tiff|"
     r"css|woff|woff2|ttf|eot|otf|"
     r"mp4|mp3|webm|ogg|wav|avi|mov|"
@@ -71,39 +70,31 @@ _SKIP_EXT = re.compile(
     re.IGNORECASE,
 )
 
-# ── HTML param / endpoint extraction (regex fallback, no BS4 required) ───────
-_INPUT_NAME    = re.compile(r"""<(?:input|select|textarea)[^>]+name\s*=\s*['"]([^'"]{1,60})['"]""", re.IGNORECASE)
+# ── HTML extraction helpers ───────────────────────────────────────────────────────────────
 _ANCHOR_HREF   = re.compile(r"""<a[^>]+href\s*=\s*['"]([^'"]{2,200})['"]""", re.IGNORECASE)
 _FORM_ACTION   = re.compile(r"""<form[^>]+action\s*=\s*['"]([^'"]{2,200})['"]""", re.IGNORECASE)
 _SCRIPT_SRC    = re.compile(r"""<script[^>]+src\s*=\s*['"]([^'"]{4,200})['"]""", re.IGNORECASE)
 _INLINE_SCRIPT = re.compile(r"""<script(?:[^>](?!src))*>(.*?)</script>""", re.IGNORECASE | re.DOTALL)
 _QUERY_KEY     = re.compile(r"[?&]([a-zA-Z0-9_\-]{1,40})=")
 
-# ── JSON walk ────────────────────────────────────────────────────────────────
+# ── JSON walk ──────────────────────────────────────────────────────────────────────────
 _URL_VALUE = re.compile(r"^https?://|^/[a-zA-Z0-9_\-/]")
 
-def _walk_json(obj, params, endpoints, base_url, domain, depth=0):
+def _walk_json(obj, endpoints, base_url, domain, depth=0):
+    """Collect in-scope endpoint URLs from a JSON object tree."""
     if depth > 10:
         return
     if isinstance(obj, dict):
-        for k, v in obj.items():
-            if isinstance(k, str):
-                raw = k.strip().lower()
-                if not is_noise_param(raw):
-                    params.add(raw)
-            _walk_json(v, params, endpoints, base_url, domain, depth + 1)
+        for v in obj.values():
+            _walk_json(v, endpoints, base_url, domain, depth + 1)
     elif isinstance(obj, list):
         for item in obj:
-            _walk_json(item, params, endpoints, base_url, domain, depth + 1)
+            _walk_json(item, endpoints, base_url, domain, depth + 1)
     elif isinstance(obj, str) and len(obj) < 300:
         if _URL_VALUE.match(obj) and "${" not in obj:
             resolved = obj if obj.startswith("http") else urljoin(base_url, obj)
             if _is_in_scope_endpoint(resolved, domain):
                 endpoints.add(resolved)
-        for k in _QUERY_KEY.findall(obj):
-            raw = k.strip().lower()
-            if not is_noise_param(raw):
-                params.add(raw)
 
 
 def _extract_html(text, page_url, domain):
@@ -111,21 +102,13 @@ def _extract_html(text, page_url, domain):
     endpoints = set()
     extra_js  = set()
 
-    # Form input names
-    for m in _INPUT_NAME.finditer(text):
-        raw = m.group(1).strip().lower()
-        if not is_noise_param(raw):
-            params.add(raw)
-
-    # Anchor hrefs → query keys + endpoint paths
+    # Query keys from anchor hrefs
     for m in _ANCHOR_HREF.finditer(text):
         href = m.group(1).strip()
         if href.startswith(("javascript:", "mailto:", "#")):
             continue
         for k in _QUERY_KEY.findall(href):
-            raw = k.strip().lower()
-            if not is_noise_param(raw):
-                params.add(raw)
+            params.add(k.strip().lower())
         resolved = href if href.startswith("http") else urljoin(page_url, href)
         if _is_in_scope_endpoint(resolved, domain):
             endpoints.add(resolved)
@@ -148,7 +131,7 @@ def _extract_html(text, page_url, domain):
         if _is_in_scope_endpoint(resolved, domain):
             extra_js.add(resolved)
 
-    # Inline scripts
+    # Inline scripts → AST param extraction + endpoint patterns
     for m in _INLINE_SCRIPT.finditer(text):
         block = m.group(1)
         if not block or len(block) < 10:
@@ -190,9 +173,10 @@ def _crawl_one(url, base_url, domain, timeout, ua):
         if "json" in ctype:
             try:
                 obj = r.json()
-                params    = set()
                 endpoints = set()
-                _walk_json(obj, params, endpoints, base_url, domain)
+                _walk_json(obj, endpoints, base_url, domain)
+                # Extract params from the raw JSON text via AST
+                params = set(extract_params(text))
                 result["params"]    = sorted(params)
                 result["endpoints"] = sorted(endpoints)
             except Exception:
@@ -225,20 +209,19 @@ def _is_crawlable(url, domain):
         if not _host_in_scope(p.netloc, domain):
             return False
         path = p.path.lower()
-        if _SKIP_EXT.search(path):
+        if SKIP_EXT.search(path):
             return False
         return True
     except Exception:
         return False
 
 
-# ── Phase runner ──────────────────────────────────────────────────────────────
+# ── Phase runner ─────────────────────────────────────────────────────────────
 
 def run(ctx, phase_num=6, total=9):
     base_url = getattr(ctx, "canonical_url", None) or ctx.target_url
     domain   = urlparse(base_url).netloc.lstrip("www.")
 
-    # Seed candidates from js_endpoints; skip anything already seen as a JS file
     seen = set(getattr(ctx, "js_files", []))
     candidates = [
         url for url in getattr(ctx, "js_endpoints", [])
@@ -275,7 +258,7 @@ def run(ctx, phase_num=6, total=9):
                     f"  {r['url']}"
                 )
 
-    # ── Collect results ───────────────────────────────────────────────────────
+    # ── Collect results ──────────────────────────────────────────────────────────────
     new_params    = set()
     new_endpoints = set()
     extra_js      = set()
@@ -293,7 +276,7 @@ def run(ctx, phase_num=6, total=9):
         if r["extra_js"]:
             extra_js.update(r["extra_js"])
 
-    # ── FIX: Process extra JS files through full js_extract pipeline ──────────
+    # ── Process extra JS files through full js_extract pipeline ─────────────────
     existing_js   = set(getattr(ctx, "js_files", []))
     new_js_files  = sorted(extra_js - existing_js - seen)
     extra_js_params_count = 0
@@ -308,7 +291,7 @@ def run(ctx, phase_num=6, total=9):
                 ex.submit(
                     process_js_file,
                     js_url,
-                    None,           # no source map hint at this stage
+                    None,
                     base_url,
                     domain,
                     crawl_timeout,
@@ -319,17 +302,12 @@ def run(ctx, phase_num=6, total=9):
             for fut in as_completed(futures):
                 r = fut.result()
                 js_file_data.append(r)
-
                 new_params.update(r["params"])
                 new_endpoints.update(r["endpoints"])
                 extra_js_params_count += len(r["params"])
 
-                # Surface any secrets found
                 if r.get("secrets"):
-                    existing_secrets = getattr(ctx, "js_file_data", [])
-                    ctx.log(
-                        f"[endpoint_crawl]   ★ {len(r['secrets'])} secrets in {r['url']}"
-                    )
+                    ctx.log(f"[endpoint_crawl]   \u2605 {len(r['secrets'])} secrets in {r['url']}")
 
                 if not ctx.silent and (r["params"] or r["endpoints"]):
                     ctx.log(
@@ -342,7 +320,7 @@ def run(ctx, phase_num=6, total=9):
         ctx.js_file_data = js_file_data
         ctx.js_files     = sorted(existing_js | set(new_js_files))
 
-    # ── Merge into ctx ────────────────────────────────────────────────────────
+    # ── Merge into ctx ───────────────────────────────────────────────────────────────
     existing_eps    = set(getattr(ctx, "js_endpoints", []))
     existing_params = set(getattr(ctx, "js_global_params", []))
 
@@ -353,16 +331,16 @@ def run(ctx, phase_num=6, total=9):
     ctx.js_global_params = sorted(existing_params | new_params)
     ctx.js_files_extra   = new_js_files
 
-    # ── Write outputs ─────────────────────────────────────────────────────────
+    # ── Write outputs ────────────────────────────────────────────────────────────────
     ctx.write_json("crawl_endpoints.json", {
-        "total_new":   len(added_eps),
-        "total_seen":  len(new_endpoints),
-        "by_url":      by_url_ep,
+        "total_new":  len(added_eps),
+        "total_seen": len(new_endpoints),
+        "by_url":     by_url_ep,
     })
     ctx.write_json("crawl_params.json", {
-        "total_new":   len(added_params),
-        "total_seen":  len(new_params),
-        "by_url":      by_url_par,
+        "total_new":  len(added_params),
+        "total_seen": len(new_params),
+        "by_url":     by_url_par,
     })
     if added_eps:
         ctx.write_text("crawl_endpoints_flat.txt", "\n".join(sorted(added_eps)))
