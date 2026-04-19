@@ -10,6 +10,8 @@ wordlist = "/usr/share/wordlists/SecLists/Discovery/Web-Content/burp-parameter-n
 [tools]
 katana       = "katana"
 subfinder    = "subfinder"
+amass        = "amass"
+chaos        = "chaos"
 gau          = "gau"
 waybackurls  = "waybackurls"
 waymore      = "waymore"
