@@ -19,6 +19,7 @@ DEFAULT_CONFIG = {
         "katana":       "katana",
         "subfinder":    "subfinder",
         "amass":        "amass",
+        "chaos":        "chaos",
         "gau":          "gau",
         "waybackurls":  "waybackurls",
         "waymore":      "waymore",
