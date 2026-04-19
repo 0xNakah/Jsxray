@@ -8,29 +8,69 @@ sync_api = ""
 wordlist = "/usr/share/wordlists/SecLists/Discovery/Web-Content/burp-parameter-names.txt"
 
 [tools]
-katana = "katana"
-subfinder = "subfinder"
-gau = "gau"
-waybackurls = "waybackurls"
-waymore = "waymore"
-httpx = "httpx"
-x8 = "x8"
-arjun = "arjun"
-uro = "uro"
+katana       = "katana"
+subfinder    = "subfinder"
+gau          = "gau"
+waybackurls  = "waybackurls"
+waymore      = "waymore"
+httpx        = "httpx"
+x8           = "x8"
+arjun        = "arjun"
+uro          = "uro"
+xnLinkFinder = "xnLinkFinder"
 
 [mode.quick]
-phases = ["intake","robots","js_discovery","js_extract","output"]
+# Fast, no external tools: robots → JS → AST params → endpoint crawl
+phases = [
+  "intake",
+  "robots",
+  "js_discovery",
+  "js_extract",
+  "endpoint_crawl",
+  "output",
+]
 
 [mode.standard]
-phases = ["intake","robots","urls","js_discovery","js_extract","deep","output"]
+# Passive harvest + JS + deep param discovery + xnLinkFinder crawl
+phases = [
+  "intake",
+  "robots",
+  "urls",
+  "js_discovery",
+  "js_extract",
+  "endpoint_crawl",
+  "deep",
+  "crawl",
+  "output",
+]
 
 [mode.full]
-phases = ["intake","subdomains","robots","urls","js_discovery","js_extract","deep","output"]
+# Everything: subdomains + standard
+phases = [
+  "intake",
+  "subdomains",
+  "robots",
+  "urls",
+  "js_discovery",
+  "js_extract",
+  "endpoint_crawl",
+  "deep",
+  "crawl",
+  "output",
+]
 
 [mode.watch]
-phases = ["intake","robots","urls","js_discovery","js_extract","output","monitor"]
+phases = [
+  "intake",
+  "robots",
+  "urls",
+  "js_discovery",
+  "js_extract",
+  "output",
+  "monitor",
+]
 
 [alerts]
-discord_webhook = ""
-telegram_token = ""
+discord_webhook  = ""
+telegram_token   = ""
 telegram_chat_id = ""
