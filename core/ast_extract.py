@@ -23,16 +23,15 @@ Node.js runtime requirement:
   The Python wrapper auto-locates the bundled JS runner alongside this file.
 
 Fallback behaviour:
-  If Node.js is absent or the subprocess fails for any reason, extract_params()
-  returns [] — the tool continues normally, producing no params for that file
-  rather than crashing.
+  If Node.js is absent or the subprocess fails for any reason,
+  extract_params_detailed() returns [] — the tool continues normally.
 """
 
 import json
 import os
 import subprocess
 
-_DIR = os.path.dirname(os.path.abspath(__file__))
+_DIR     = os.path.dirname(os.path.abspath(__file__))
 _JS_FILE = os.path.join(_DIR, "ast_extract_runner.js")
 
 
@@ -52,27 +51,35 @@ def _node_available() -> bool:
 _NODE_OK = _node_available()
 
 
-def extract_params(text: str) -> list[str]:
+def extract_params_detailed(text: str, log_fn=None) -> list[dict]:
     """
     Run the AST v5 engine on raw JS source or sourcemap content.
 
-    Returns a sorted list of unique parameter names.
+    Returns a list of dicts, each with:
+        {
+            "value":      str,            # parameter name
+            "confidence": "HIGH" | "MED", # HIGH = structural AST hit
+            "source":     str,            # tier tag, e.g. "req_member_read"
+        }
+
     Falls back to [] on any error so js_extract.py never crashes.
+    log_fn: optional callable(str) for debug output.
     """
-    detailed = extract_params_detailed(text)
-    return sorted({p["value"] for p in detailed})
+    if not _NODE_OK:
+        if log_fn:
+            log_fn("[ast_extract] Node.js not available — AST extraction skipped")
+        return []
 
-
-def extract_params_detailed(text: str) -> list[dict]:
-    """
-    Return full per-param dicts:
-        [{"value": "user_id", "confidence": "HIGH", "source": "req_member_read"}, ...]
-    """
-    if not _NODE_OK or not text or not text.strip():
+    if not text or not text.strip():
         return []
 
     if not os.path.isfile(_JS_FILE):
+        if log_fn:
+            log_fn(f"[ast_extract] Runner not found: {_JS_FILE}")
         return []
+
+    # Scale timeout to input size: 10s minimum, 60s max, ~1s per 50KB
+    timeout = max(10, min(60, len(text) // 50_000))
 
     try:
         result = subprocess.run(
@@ -80,7 +87,7 @@ def extract_params_detailed(text: str) -> list[dict]:
             input=text,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=timeout,
         )
         if result.returncode != 0 or not result.stdout.strip():
             return []
@@ -89,3 +96,13 @@ def extract_params_detailed(text: str) -> list[dict]:
         return data.get("params", [])
     except Exception:
         return []
+
+
+def extract_params(text: str, log_fn=None) -> list[str]:
+    """
+    Convenience wrapper — returns a flat sorted list of unique param names.
+    Confidence/source metadata is discarded; use extract_params_detailed()
+    when you need per-param confidence scores.
+    """
+    detailed = extract_params_detailed(text, log_fn=log_fn)
+    return sorted({p["value"] for p in detailed})
