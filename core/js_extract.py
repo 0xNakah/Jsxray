@@ -15,7 +15,7 @@ import re, requests, json
 from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from core.context import Context
-from core.ast_extract import extract_params_detailed
+from core.ast_extract import extract_params_detailed, extract_params
 
 HEADERS = {
     "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -37,6 +37,29 @@ HIGH_VALUE_PARAMS = {
     "file","filename","path","dir","folder","upload","attachment",
     "callback","cb","jsonp","handler","fn",
 }
+
+# Noise param filter — used by endpoint_crawl.py and internally
+_NOISE_PARAM_RE = re.compile(
+    r"^(?:__\w+|ng-\w+|v-\w+|data-\w+|aria-\w+|on\w{2,}|\d+|\w{1,2})$",
+    re.IGNORECASE,
+)
+_NOISE_VALUES = {
+    "true", "false", "null", "undefined", "none", "nan",
+    "function", "object", "string", "number", "boolean", "symbol",
+    "this", "self", "window", "document", "prototype",
+    "constructor", "__proto__", "hasownproperty",
+}
+
+def is_noise_param(name: str) -> bool:
+    """Return True if the param name looks like noise and should be filtered out."""
+    if not name or len(name) > 60:
+        return True
+    cleaned = name.strip().lower()
+    if cleaned in _NOISE_VALUES:
+        return True
+    if _NOISE_PARAM_RE.match(cleaned):
+        return True
+    return False
 
 
 def _host_in_scope(host: str, domain: str) -> bool:
@@ -284,7 +307,7 @@ def process_js_file(js_url, map_url, base_url, domain, timeout, ua):
     if not text:
         return result
 
-    # AST extraction — keep full detail for confidence threading
+    # AST extraction via ast_extract — keeps full detail for confidence threading
     detailed = extract_params_detailed(text)
     result["param_detail"] = detailed
     result["params"]      = sorted({p["value"] for p in detailed})
@@ -391,33 +414,33 @@ def run(ctx, phase_num=5, total=9):
 
     ctx.js_files                = sorted(seen_js)
     ctx.js_global_params        = sorted(global_params)
-    ctx.js_high_confidence_params = sorted(global_high)   # NEW — HIGH confidence only
+    ctx.js_high_confidence_params = sorted(global_high)
     ctx.js_endpoints            = sorted(global_ep)
     ctx.js_param_map            = {ep: sorted(p)  for ep, p in param_map.items()}
-    ctx.js_param_map_high       = {ep: sorted(p)  for ep, p in param_map_high.items()}  # NEW
+    ctx.js_param_map_high       = {ep: sorted(p)  for ep, p in param_map_high.items()}
     ctx.js_file_data            = all_results
 
     high_value = [p for p in ctx.js_global_params if p in HIGH_VALUE_PARAMS]
     high_value_confident = [p for p in ctx.js_high_confidence_params if p in HIGH_VALUE_PARAMS]
 
     ctx.write_json("js_params.json", {
-        "total_params":        len(ctx.js_global_params),
+        "total_params":          len(ctx.js_global_params),
         "total_high_confidence": len(ctx.js_high_confidence_params),
-        "high_value":          high_value,
-        "high_value_confident": high_value_confident,
-        "all_params":          ctx.js_global_params,
-        "high_confidence":     ctx.js_high_confidence_params,
-        "by_endpoint":         ctx.js_param_map,
-        "by_endpoint_high":    ctx.js_param_map_high,
+        "high_value":            high_value,
+        "high_value_confident":  high_value_confident,
+        "all_params":            ctx.js_global_params,
+        "high_confidence":       ctx.js_high_confidence_params,
+        "by_endpoint":           ctx.js_param_map,
+        "by_endpoint_high":      ctx.js_param_map_high,
     })
     ctx.write_json("js_endpoints.json", {
         "total":     len(ctx.js_endpoints),
         "endpoints": ctx.js_endpoints,
     })
-    ctx.write_text("js_params_flat.txt",             "\n".join(ctx.js_global_params))
-    ctx.write_text("js_params_high_confidence.txt",  "\n".join(ctx.js_high_confidence_params))
-    ctx.write_text("js_endpoints_flat.txt",          "\n".join(ctx.js_endpoints))
-    ctx.write_text("js_files.txt",                   "\n".join(ctx.js_files))
+    ctx.write_text("js_params_flat.txt",            "\n".join(ctx.js_global_params))
+    ctx.write_text("js_params_high_confidence.txt", "\n".join(ctx.js_high_confidence_params))
+    ctx.write_text("js_endpoints_flat.txt",         "\n".join(ctx.js_endpoints))
+    ctx.write_text("js_files.txt",                  "\n".join(ctx.js_files))
 
     if lazy_chunks_total:
         ctx.write_json("lazy_chunks.json", {
