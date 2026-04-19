@@ -30,7 +30,7 @@ def parse_robots_simple(raw):
                 paths.append(p)
     return list(set(paths))
 
-# ── Passive sources ───────────────────────────────────────────────────────────────────────
+# ── Passive sources ──────────────────────────────────────────────────────────────────────────────────────
 
 def passive_crtsh(domain, timeout, ua):
     hosts = []
@@ -178,7 +178,7 @@ def passive_from_url_pool(url_pool, domain):
     return _dedup(hosts)
 
 
-# ── Active probes ──────────────────────────────────────────────────────────────────────
+# ── Active probes ───────────────────────────────────────────────────────────────────────────────────────
 
 def active_dns(host, timeout):
     try:
@@ -208,7 +208,7 @@ def active_httpx(hosts, workspace, timeout):
     return []
 
 
-# ── Phase runner ───────────────────────────────────────────────────────────────────────
+# ── Phase runner ───────────────────────────────────────────────────────────────────────────────────────
 
 def run(ctx: Context, phase_num=2, total=10) -> Context:
     domain = getattr(ctx, 'target', '').strip()
@@ -247,6 +247,21 @@ def run(ctx: Context, phase_num=2, total=10) -> Context:
         source_counts['amass'] = len(amass_hosts)
     else:
         source_counts['amass'] = 0
+
+    # chaos passive
+    if check_tool('chaos', ctx.config):
+        out_file = os.path.join(ctx.workspace, 'subdomains_chaos.txt')
+        try:
+            subprocess.run(['chaos', '-d', domain, '-silent', '-o', out_file],
+                           capture_output=True, timeout=180)
+        except Exception:
+            pass
+        chaos_hosts = ([s.strip().lower() for s in open(out_file).read().splitlines() if s.strip()]
+                       if os.path.exists(out_file) else [])
+        passive.extend([h for h in chaos_hosts if _in_scope(h, domain)])
+        source_counts['chaos'] = len(chaos_hosts)
+    else:
+        source_counts['chaos'] = 0
 
     # All pure-HTTP passive sources in parallel
     ua = ctx.user_agent
