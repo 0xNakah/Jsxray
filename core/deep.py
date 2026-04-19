@@ -9,13 +9,31 @@ HIGH_VALUE_KEYWORDS = [
     "/query", "/data", "/fetch", "/get", "/post",
 ]
 
+
+def _resolve_wordlist(ctx) -> str | None:
+    """
+    Resolve the wordlist path in priority order:
+      1. ctx.config['defaults']['wordlist']  (jsxray.toml)
+      2. <workspace>/js_params_wordlist.txt  (legacy fallback)
+    Returns the path if the file exists and is non-empty, else None.
+    """
+    candidates = [
+        ctx.config.get("defaults", {}).get("wordlist", ""),
+        os.path.join(ctx.workspace, "js_params_wordlist.txt"),
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path) and os.path.getsize(path) >= 5:
+            return path
+    return None
+
+
 def parse_source_map(map_url, timeout, ua):
     try:
         r = requests.get(map_url, timeout=timeout, headers={"User-Agent": ua})
         sources = r.json().get("sources", [])
         return [s for s in sources if any(k in s for k in
                 ['route', 'page', 'api', 'view', 'controller', 'endpoint'])]
-    except Exception as e:
+    except Exception:
         return []
 
 
@@ -30,10 +48,11 @@ def run_x8(url, wordlist, out_file, config, ua):
                 capture_output=True, timeout=90,
             )
             if os.path.exists(out_file) and os.path.getsize(out_file) > 2:
-                data = json.load(open(out_file))
+                with open(out_file) as f:
+                    data = json.load(f)
                 if data:
                     return data
-        except Exception as e:
+        except Exception:
             pass
     return {}
 
@@ -47,24 +66,28 @@ def run_arjun(url, wordlist, out_file, config, ua):
             capture_output=True, timeout=90,
         )
         if os.path.exists(out_file):
-            return json.load(open(out_file))
-    except Exception as e:
+            with open(out_file) as f:
+                return json.load(f)
+    except Exception:
         pass
     return {}
 
 
 def _probe_url(url, wordlist, config, ua, workspace, use_x8, use_arjun):
-    """Run x8 and/or arjun on a single URL, merge results."""
+    """Run x8 and/or arjun on a single URL, merge results, clean up temp files."""
     key      = abs(hash(url)) % 9999999
     combined = {}
+    tmp_files = []
 
     futures_map = {}
     with ThreadPoolExecutor(max_workers=2) as ex:
         if use_x8:
             out = os.path.join(workspace, f"x8_{key}.json")
+            tmp_files.append(out)
             futures_map[ex.submit(run_x8, url, wordlist, out, config, ua)] = "x8"
         if use_arjun:
             out = os.path.join(workspace, f"arjun_{key}.json")
+            tmp_files.append(out)
             futures_map[ex.submit(run_arjun, url, wordlist, out, config, ua)] = "arjun"
 
         for fut in as_completed(futures_map):
@@ -75,6 +98,14 @@ def _probe_url(url, wordlist, config, ua, workspace, use_x8, use_arjun):
                         combined.setdefault(ep, set()).update(params)
             except Exception:
                 pass
+
+    # Clean up temp JSON files after reading
+    for tmp in tmp_files:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
 
     return {ep: list(p) for ep, p in combined.items()}
 
@@ -100,22 +131,25 @@ def run(ctx: Context, phase_num=6, total=9) -> Context:
                 eps = parse_source_map(map_url, ctx.timeout, ctx.user_agent)
                 ctx.js_endpoints.extend(eps)
                 if eps:
-                    ctx.log(f"[deep]   Source map → {len(eps)} new endpoints")
+                    ctx.log(f"[deep]   Source map \u2192 {len(eps)} new endpoints")
             except Exception as e:
                 ctx.log(f"[deep]   Source map error ({map_url}): {e}")
 
-    wordlist = os.path.join(ctx.workspace, "js_params_wordlist.txt")
-    if not os.path.exists(wordlist) or os.path.getsize(wordlist) < 5:
+    wordlist = _resolve_wordlist(ctx)
+    if not wordlist:
         ctx.phases_run.append("deep")
         ctx.log_phase_done(phase_num, total, "deep",
-                           "source maps parsed, no wordlist for param discovery")
+                           "source maps parsed, no wordlist for param discovery "
+                           "(set defaults.wordlist in jsxray.toml)")
         return ctx
+
+    ctx.log(f"[deep] Wordlist: {wordlist}")
 
     use_x8    = check_tool("x8",    ctx.config)
     use_arjun = check_tool("arjun", ctx.config)
 
     if not use_x8 and not use_arjun:
-        ctx.log("[deep] Neither x8 nor arjun found — skipping param discovery")
+        ctx.log("[deep] Neither x8 nor arjun found \u2014 skipping param discovery")
         ctx.phases_run.append("deep")
         ctx.log_phase_done(phase_num, total, "deep",
                            "source maps parsed (install x8 or arjun for hidden param discovery)")
@@ -149,7 +183,7 @@ def run(ctx: Context, phase_num=6, total=9) -> Context:
                 for ep, params in data.items():
                     if params:
                         hidden[ep] = params
-                        ctx.log(f"[deep]   ★ {len(params)} params on {ep}")
+                        ctx.log(f"[deep]   \u2605 {len(params)} params on {ep}")
             except Exception as e:
                 ctx.log(f"[deep]   error on {url}: {e}")
 
