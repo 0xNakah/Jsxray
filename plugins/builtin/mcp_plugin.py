@@ -8,12 +8,13 @@ Two operating modes
 -------------------
   Plugin mode   — loaded by jsxray.py after a scan finishes (read-only, one ctx)
   Standalone    — python3 -m plugins.builtin.mcp_plugin
-                  Persistent SSE server. AI can kick off scans on demand.
+                  Persistent server. AI can kick off scans on demand.
 
 Transports
 ----------
-  stdio  — Claude Desktop spawns the process, talks over stdin/stdout
-  sse    — HTTP server at http://host:port/sse  (required for Perplexity)
+  stdio            — Claude Desktop spawns the process, talks over stdin/stdout
+  streamable-http  — HTTP server at http://host:port/mcp  (Perplexity, Cursor, etc.)
+                     Supersedes the legacy /sse transport (mcp >= 1.6)
 
 Tools
 -----
@@ -29,19 +30,19 @@ TOML config (plugin mode)
 -------------------------
     [plugins.mcp]
     enabled      = true
-    transport    = "sse"        # "stdio" | "sse"
+    transport    = "streamable-http"   # "stdio" | "streamable-http"
     host         = "127.0.0.1"
     port         = 9000
-    allow_scan   = false        # true to expose jsxray_scan in plugin mode too
+    allow_scan   = false               # true to expose jsxray_scan in plugin mode too
 
 Standalone usage
 ----------------
-    python3 -m plugins.builtin.mcp_plugin [--host 0.0.0.0] [--port 9000]
+    python3 -m plugins.builtin.mcp_plugin [--host 0.0.0.0] [--port 9000] [--transport streamable-http]
 
 Dependencies
 ------------
-    pip install mcp uvicorn starlette    # SSE transport
-    pip install mcp                      # stdio only
+    pip install "mcp[cli]" uvicorn starlette    # streamable-http transport
+    pip install mcp                              # stdio only
 """
 
 import json
@@ -55,25 +56,25 @@ from plugins.base import BasePlugin
 # ── Scan registry ─────────────────────────────────────────────────────────────
 #
 # Keyed by target string. Each entry:
-#   "status"   : "running" | "done" | "failed"
-#   "ctx"      : Context object (when done)
-#   "summary"  : dict from ctx.to_summary() (when done)
-#   "started"  : unix timestamp
-#   "elapsed"  : seconds (when done)
+#   "status"  : "running" | "done" | "failed"
+#   "ctx"     : Context object (when done, plugin mode only)
+#   "summary" : dict from ctx.to_summary() or loaded from summary.json
+#   "started" : unix timestamp
+#   "elapsed" : seconds (when done)
 #
 _scans: dict = {}
-_scans_lock   = threading.Lock()
+_scans_lock  = threading.Lock()
 
 
 class Plugin(BasePlugin):
     name        = "mcp"
     description = "MCP server — AI can trigger JSXray scans and query results"
-    version     = "0.2.0"
+    version     = "0.3.0"
     plugin_type = "mcp"
 
     def __init__(self, config: dict = None):
         super().__init__(config)
-        self.transport  = self.config.get("transport", "sse")
+        self.transport  = self.config.get("transport", "streamable-http")
         self.host       = self.config.get("host", "127.0.0.1")
         self.port       = int(self.config.get("port", 9000))
         self.allow_scan = self.config.get("allow_scan", False)
@@ -94,27 +95,26 @@ class Plugin(BasePlugin):
 
     def _start(self, expose_scan_tool: bool = True):
         try:
-            import mcp.types as types
-            from mcp.server import Server
+            from mcp.server.fastmcp import FastMCP
         except ImportError:
             self.log(
                 "'mcp' package not found.\n"
-                "  pip install mcp uvicorn starlette"
+                '  pip install "mcp[cli]" uvicorn starlette'
             )
             return
 
-        server = _build_server(Server, types, expose_scan_tool=expose_scan_tool)
+        mcp_server = _build_fastmcp(expose_scan_tool=expose_scan_tool)
 
-        if self.transport == "sse":
-            _serve_sse(server, self.host, self.port, blocking=False)
+        if self.transport == "streamable-http":
+            _serve_streamable_http(mcp_server, self.host, self.port, blocking=False)
             self.log(
-                f"SSE → http://{self.host}:{self.port}/sse\n"
-                f"  Perplexity / Claude config:\n"
-                f'    url: "http://{self.host}:{self.port}/sse"'
+                f"Streamable HTTP → http://{self.host}:{self.port}/mcp\n"
+                f"  Perplexity / Cursor config:\n"
+                f'    url: "http://{self.host}:{self.port}/mcp"'
             )
         else:
             self.log("stdio transport (blocking)")
-            _serve_stdio(server)
+            mcp_server.run(transport="stdio")
 
 
 # ── Scan registry helpers ────────────────────────────────────────────────────
@@ -147,148 +147,59 @@ def _get_ctx(target: str | None):
     if target:
         entry = _scans.get(target)
         if entry and entry["status"] == "done":
-            return entry["ctx"]
+            return entry.get("ctx")
         return None
     return _latest_ctx()
 
 
-# ── MCP server builder ────────────────────────────────────────────────────────
+def _get_summary(target: str | None) -> dict | None:
+    """Return summary dict for a target even when ctx is None (standalone mode)."""
+    if target:
+        entry = _scans.get(target)
+        if entry and entry["status"] == "done":
+            return entry.get("summary")
+        return None
+    with _scans_lock:
+        done = [v for v in _scans.values() if v["status"] == "done"]
+    if not done:
+        return None
+    return max(done, key=lambda v: v["started"]).get("summary")
 
-def _build_server(Server, types, expose_scan_tool: bool = True):
-    server = Server("jsxray")
 
-    # ── list_tools ────────────────────────────────────────────────────────
-    @server.list_tools()
-    async def list_tools():
-        tools = []
+# ── FastMCP server builder ────────────────────────────────────────────────────
 
-        if expose_scan_tool:
-            tools += [
-                types.Tool(
-                    name="jsxray_scan",
-                    description=(
-                        "Trigger a new JSXray scan against a target domain. "
-                        "The scan runs in the background. Poll jsxray_scan_status "
-                        "to check progress, then use the read tools to query results."
-                    ),
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "target": {
-                                "type": "string",
-                                "description": "Target domain or URL, e.g. target.com",
-                            },
-                            "mode": {
-                                "type": "string",
-                                "enum": ["quick", "standard", "full"],
-                                "description": "Scan depth. quick=no external tools, standard=passive+deep, full=+subdomains. Default: quick.",
-                            },
-                        },
-                        "required": ["target"],
-                    },
-                ),
-                types.Tool(
-                    name="jsxray_scan_status",
-                    description="Check the status of a running or completed scan.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "target": {
-                                "type": "string",
-                                "description": "Target to check. Omit to list all scans.",
-                            }
-                        },
-                    },
-                ),
-            ]
+def _build_fastmcp(expose_scan_tool: bool = True):
+    from mcp.server.fastmcp import FastMCP
 
-        tools += [
-            types.Tool(
-                name="jsxray_summary",
-                description=(
-                    "Return the full scan summary: target, mode, elapsed, "
-                    "tech stack, and all stats (JS files, endpoints, params, secrets, hidden params)."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "target": {
-                            "type": "string",
-                            "description": "Target to query. Omit to use the most recent scan.",
-                        }
-                    },
-                },
-            ),
-            types.Tool(
-                name="jsxray_js_endpoints",
-                description="List all endpoints extracted from JavaScript files (fetch, XHR, API paths).",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "target": {"type": "string", "description": "Target to query. Omit for latest."},
-                        "limit":  {"type": "integer", "description": "Max results (default 200)."},
-                    },
-                },
-            ),
-            types.Tool(
-                name="jsxray_params",
-                description=(
-                    "List all discovered parameters. Returns 'global' (across all JS) "
-                    "and 'per_file' (per JS file). Filter by file_filter substring."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "target":      {"type": "string", "description": "Target to query. Omit for latest."},
-                        "file_filter": {"type": "string", "description": "Filter by JS filename substring."},
-                    },
-                },
-            ),
-            types.Tool(
-                name="jsxray_secrets",
-                description="List credential/secret hints found in JS files (API keys, tokens, passwords).",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "target": {"type": "string", "description": "Target to query. Omit for latest."},
-                    },
-                },
-            ),
-            types.Tool(
-                name="jsxray_hidden_params",
-                description="List hidden params found by x8/arjun fuzzing. Filter by endpoint_filter substring.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "target":          {"type": "string", "description": "Target to query. Omit for latest."},
-                        "endpoint_filter": {"type": "string", "description": "Filter by endpoint URL substring."},
-                    },
-                },
-            ),
-        ]
-        return tools
+    mcp = FastMCP("jsxray")
 
-    # ── call_tool ────────────────────────────────────────────────────────
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict | None):
-        a = arguments or {}
-
-        # ── jsxray_scan ─────────────────────────────────────────────────
-        if name == "jsxray_scan":
-            target = a.get("target", "").strip()
-            mode   = a.get("mode", "quick")
-
+    # ── jsxray_scan ────────────────────────────────────────────────────────
+    if expose_scan_tool:
+        @mcp.tool(
+            description=(
+                "Trigger a new JSXray scan against a target domain. "
+                "The scan runs in the background. Poll jsxray_scan_status "
+                "to check progress, then use the read tools to query results."
+            )
+        )
+        def jsxray_scan(target: str, mode: str = "quick") -> dict:
+            """
+            Args:
+                target: Target domain or URL, e.g. target.com
+                mode:   Scan depth — quick | standard | full
+            """
+            target = target.strip()
             if not target:
-                return [types.TextContent(type="text", text=json.dumps({"error": "target is required"}))]
+                return {"error": "target is required"}
 
             with _scans_lock:
                 existing = _scans.get(target, {})
                 if existing.get("status") == "running":
-                    return [types.TextContent(type="text", text=json.dumps({
+                    return {
                         "status":  "already_running",
                         "target":  target,
                         "message": "Scan already in progress. Poll jsxray_scan_status.",
-                    }))]
+                    }
                 _scans[target] = {"status": "running", "started": time.time(), "ctx": None}
 
             def _run_scan():
@@ -310,7 +221,6 @@ def _build_server(Server, types, expose_scan_tool: bool = True):
                         capture_output=True,
                         text=True,
                     )
-                    # Load the output JSON from the workspace
                     _load_scan_output(target, jsxray_root, result)
                 except Exception as e:
                     with _scans_lock:
@@ -319,83 +229,123 @@ def _build_server(Server, types, expose_scan_tool: bool = True):
 
             threading.Thread(target=_run_scan, daemon=True).start()
 
-            return [types.TextContent(type="text", text=json.dumps({
+            return {
                 "status":  "started",
                 "target":  target,
                 "mode":    mode,
                 "message": "Scan started. Poll jsxray_scan_status for updates, then query results.",
-            }))]
+            }
 
-        # ── jsxray_scan_status ──────────────────────────────────────────
-        if name == "jsxray_scan_status":
-            target = a.get("target")
+        @mcp.tool(description="Check the status of a running or completed scan.")
+        def jsxray_scan_status(target: str = "") -> dict:
+            """
+            Args:
+                target: Target to check. Omit to list all scans.
+            """
             with _scans_lock:
                 if target:
                     entry = _scans.get(target)
                     if not entry:
-                        data = {"error": f"No scan found for '{target}'"}
-                    else:
-                        data = {
-                            "target":  target,
-                            "status":  entry["status"],
-                            "elapsed": round(time.time() - entry["started"], 1),
-                        }
-                        if entry["status"] == "done":
-                            data["summary"] = entry.get("summary", {})
-                        if entry["status"] == "failed":
-                            data["error"] = entry.get("error", "unknown error")
-                else:
+                        return {"error": f"No scan found for '{target}'"}
                     data = {
-                        t: {"status": v["status"], "elapsed": round(time.time() - v["started"], 1)}
-                        for t, v in _scans.items()
+                        "target":  target,
+                        "status":  entry["status"],
+                        "elapsed": round(time.time() - entry["started"], 1),
                     }
-            return [types.TextContent(type="text", text=json.dumps(data, indent=2))]
+                    if entry["status"] == "done":
+                        data["summary"] = entry.get("summary", {})
+                    if entry["status"] == "failed":
+                        data["error"] = entry.get("error", "unknown error")
+                    return data
+                return {
+                    t: {"status": v["status"], "elapsed": round(time.time() - v["started"], 1)}
+                    for t, v in _scans.items()
+                }
 
-        # ── read tools ─────────────────────────────────────────────────
-        ctx = _get_ctx(a.get("target"))
+    # ── read tools ─────────────────────────────────────────────────────────
 
-        if name == "jsxray_summary":
-            data = ctx.to_summary() if ctx else {"error": "no scan results available"}
-            return [types.TextContent(type="text", text=json.dumps(data, indent=2))]
+    @mcp.tool(
+        description=(
+            "Return the full scan summary: target, mode, elapsed, "
+            "tech stack, and all stats (JS files, endpoints, params, secrets, hidden params)."
+        )
+    )
+    def jsxray_summary(target: str = "") -> dict:
+        ctx = _get_ctx(target or None)
+        if ctx:
+            return ctx.to_summary()
+        summary = _get_summary(target or None)
+        return summary if summary else {"error": "no scan results available"}
 
-        if name == "jsxray_js_endpoints":
-            limit = int(a.get("limit", 200))
-            data  = (ctx.js_endpoints or [])[:limit] if ctx else []
-            return [types.TextContent(type="text", text=json.dumps(data, indent=2))]
+    @mcp.tool(description="List all endpoints extracted from JavaScript files (fetch, XHR, API paths).")
+    def jsxray_js_endpoints(target: str = "", limit: int = 200) -> list:
+        ctx = _get_ctx(target or None)
+        if ctx:
+            return (ctx.js_endpoints or [])[:limit]
+        summary = _get_summary(target or None)
+        if summary:
+            return summary.get("js_endpoints", [])[:limit]
+        return []
 
-        if name == "jsxray_params":
-            ff = a.get("file_filter", "").lower()
-            data = {
+    @mcp.tool(
+        description=(
+            "List all discovered parameters. Returns 'global' (across all JS) "
+            "and 'per_file' (per JS file). Filter by file_filter substring."
+        )
+    )
+    def jsxray_params(target: str = "", file_filter: str = "") -> dict:
+        ctx = _get_ctx(target or None)
+        ff  = file_filter.lower()
+        if ctx:
+            return {
                 "global":   ctx.js_global_params,
                 "per_file": {k: v for k, v in ctx.js_param_map.items() if ff in k.lower()},
-            } if ctx else {}
-            return [types.TextContent(type="text", text=json.dumps(data, indent=2))]
+            }
+        summary = _get_summary(target or None)
+        if summary:
+            return {
+                "global":   summary.get("js_global_params", []),
+                "per_file": {},
+            }
+        return {}
 
-        if name == "jsxray_secrets":
+    @mcp.tool(description="List credential/secret hints found in JS files (API keys, tokens, passwords).")
+    def jsxray_secrets(target: str = "") -> list:
+        ctx = _get_ctx(target or None)
+        if ctx:
             secrets = []
-            if ctx:
-                for fd in ctx.js_file_data:
-                    for s in fd.get("secrets", []):
-                        secrets.append({"file": fd.get("url", ""), **s})
-            return [types.TextContent(type="text", text=json.dumps(secrets, indent=2))]
+            for fd in ctx.js_file_data:
+                for s in fd.get("secrets", []):
+                    secrets.append({"file": fd.get("url", ""), **s})
+            return secrets
+        summary = _get_summary(target or None)
+        if summary:
+            return summary.get("secrets", [])
+        return []
 
-        if name == "jsxray_hidden_params":
-            ef = a.get("endpoint_filter", "").lower()
-            data = {
-                k: v for k, v in ctx.hidden_params.items() if ef in k.lower()
-            } if ctx else {}
-            return [types.TextContent(type="text", text=json.dumps(data, indent=2))]
+    @mcp.tool(description="List hidden params found by x8/arjun fuzzing. Filter by endpoint_filter substring.")
+    def jsxray_hidden_params(target: str = "", endpoint_filter: str = "") -> dict:
+        ctx = _get_ctx(target or None)
+        ef  = endpoint_filter.lower()
+        if ctx:
+            return {k: v for k, v in ctx.hidden_params.items() if ef in k.lower()}
+        summary = _get_summary(target or None)
+        if summary:
+            return {
+                k: v for k, v in summary.get("hidden_params", {}).items()
+                if ef in k.lower()
+            }
+        return {}
 
-        return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
+    return mcp
 
-    return server
 
+# ── Scan output loader ────────────────────────────────────────────────────────
 
 def _load_scan_output(target: str, jsxray_root: str, proc_result):
     """
-    After jsxray.py finishes, reconstruct a lightweight summary from the
-    output JSON written to the workspace and store it in _scans.
-    We import Context and replay from the saved summary.json if present.
+    After jsxray.py finishes, load summary.json from the workspace and
+    store it in _scans. Works in standalone mode where ctx is never set.
     """
     import glob
 
@@ -420,7 +370,6 @@ def _load_scan_output(target: str, jsxray_root: str, proc_result):
         except Exception:
             pass
 
-    # Fallback: mark done with stderr as error note
     with _scans_lock:
         if proc_result.returncode != 0:
             _scans[target]["status"] = "failed"
@@ -430,43 +379,24 @@ def _load_scan_output(target: str, jsxray_root: str, proc_result):
             _scans[target]["summary"] = {"note": "summary.json not found in workspace"}
 
 
-# ── Transport helpers ────────────────────────────────────────────────────────────
+# ── Transport helpers ─────────────────────────────────────────────────────────
 
-def _serve_stdio(server):
-    import asyncio
-    import mcp.server.stdio as mcp_stdio
-
-    async def _run():
-        async with mcp_stdio.stdio_server() as (read, write):
-            await server.run(
-                read, write,
-                server.create_initialization_options(),
-                raise_exceptions=True,
-            )
-    asyncio.run(_run())
-
-
-def _serve_sse(server, host: str, port: int, blocking: bool = True):
+def _serve_streamable_http(mcp_server, host: str, port: int, blocking: bool = True):
+    """
+    Mount the FastMCP app at /mcp using Starlette + uvicorn.
+    FastMCP.streamable_http_app() returns a proper ASGI app — no manual
+    SSE wiring needed, fully compatible with mcp >= 1.6 / 1.27.
+    """
     try:
-        from mcp.server.sse import SseServerTransport
         from starlette.applications import Starlette
-        from starlette.routing import Mount, Route
+        from starlette.routing import Mount
         import uvicorn
     except ImportError as e:
-        print(f"[mcp] SSE deps missing: {e} — pip install mcp uvicorn starlette")
+        print(f"[mcp] Missing deps: {e}  →  pip install uvicorn starlette")
         return
 
-    sse = SseServerTransport("/messages")
-
-    async def handle_sse(request):
-        async with sse.connect_sse(
-            request.scope, request.receive, request._send
-        ) as (read, write):
-            await server.run(read, write, server.create_initialization_options())
-
     app = Starlette(routes=[
-        Route("/sse",      endpoint=handle_sse),
-        Mount("/messages", app=sse.handle_post_message),
+        Mount("/mcp", app=mcp_server.streamable_http_app()),
     ])
 
     config = uvicorn.Config(app, host=host, port=port, log_level="warning")
@@ -480,10 +410,11 @@ def _serve_sse(server, host: str, port: int, blocking: bool = True):
         thread.start()
 
 
-# ── Standalone entry point ──────────────────────────────────────────────────────
+# ── Standalone entry point ────────────────────────────────────────────────────
 #
-# python3 -m plugins.builtin.mcp_plugin
-# python3 -m plugins.builtin.mcp_plugin --host 0.0.0.0 --port 9000
+#  python3 -m plugins.builtin.mcp_plugin
+#  python3 -m plugins.builtin.mcp_plugin --host 0.0.0.0 --port 9000
+#  python3 -m plugins.builtin.mcp_plugin --transport stdio
 
 if __name__ == "__main__":
     import argparse
@@ -491,23 +422,24 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description="JSXray MCP standalone server")
     p.add_argument("--host",      default="127.0.0.1")
     p.add_argument("--port",      type=int, default=9000)
-    p.add_argument("--transport", default="sse", choices=["sse", "stdio"])
+    p.add_argument("--transport", default="streamable-http",
+                   choices=["streamable-http", "stdio"])
     args = p.parse_args()
 
     try:
-        import mcp.types as types
-        from mcp.server import Server
+        from mcp.server.fastmcp import FastMCP  # noqa: F401
     except ImportError:
-        print("[mcp] Install: pip install mcp uvicorn starlette")
+        print('[mcp] Install: pip install "mcp[cli]" uvicorn starlette')
         sys.exit(1)
 
-    server = _build_server(Server, types, expose_scan_tool=True)
+    mcp_server = _build_fastmcp(expose_scan_tool=True)
 
     if args.transport == "stdio":
         print("[mcp] stdio transport (blocking)")
-        _serve_stdio(server)
+        mcp_server.run(transport="stdio")
     else:
-        print(f"[mcp] SSE server → http://{args.host}:{args.port}/sse")
-        print(f"[mcp] Perplexity config: url = \"http://{args.host}:{args.port}/sse\"")
+        url = f"http://{args.host}:{args.port}/mcp"
+        print(f"[mcp] Streamable HTTP → {url}")
+        print(f'[mcp] Perplexity / Cursor config: url = "{url}"')
         print("[mcp] Waiting for connections... (Ctrl+C to stop)")
-        _serve_sse(server, args.host, args.port, blocking=True)
+        _serve_streamable_http(mcp_server, args.host, args.port, blocking=True)
