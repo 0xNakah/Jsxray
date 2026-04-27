@@ -1,17 +1,19 @@
 """
-js_extract.py — JS Parameter & Endpoint Extraction
+js_extract.py — JS Orchestration Phase
 
-Uses the AST v5 extraction module (ast_extract.py) for parameter discovery.
-Endpoint, secret, sourcemap, and lazy-chunk extraction remain here.
+Fetches JS files and source maps, then delegates:
+  - Params      → ast_extract (Node.js AST, no regex)
+  - Endpoints   → ENDPOINT_PATTERNS (regex)
+  - Lazy chunks → LAZY_CHUNK_PATTERNS (regex)
+  - Secrets     → SECRET_PATTERNS (regex)
 """
 
 import re
-import json
 import requests
 from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from core.context import Context
-from core.ast_extract import extract_params_detailed, extract_params
+from core.ast_extract import extract_params_detailed
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -33,28 +35,6 @@ HIGH_VALUE_PARAMS = {
     "file", "filename", "path", "dir", "folder", "upload", "attachment",
     "callback", "cb", "jsonp", "handler", "fn",
 }
-
-_NOISE_PARAM_RE = re.compile(
-    r"^(?:__\w+|ng-\w+|v-\w+|data-\w+|aria-\w+|on\w{2,}|\d+|\w{1,2})$",
-    re.IGNORECASE,
-)
-_NOISE_VALUES = {
-    "true", "false", "null", "undefined", "none", "nan",
-    "function", "object", "string", "number", "boolean", "symbol",
-    "this", "self", "window", "document", "prototype",
-    "constructor", "__proto__", "hasownproperty",
-}
-
-
-def is_noise_param(name: str) -> bool:
-    if not name or len(name) > 60:
-        return True
-    cleaned = name.strip().lower()
-    if cleaned in _NOISE_VALUES:
-        return True
-    if _NOISE_PARAM_RE.match(cleaned):
-        return True
-    return False
 
 
 def _host_in_scope(host: str, domain: str) -> bool:
@@ -285,14 +265,14 @@ def process_js_file(js_url, map_url, base_url, domain, timeout, ua):
         return result
 
     detailed = extract_params_detailed(text)
-    result["params"]    = sorted({p["value"] for p in detailed})
-    result["endpoints"] = extract_endpoints(text, base_url, domain)
-    result["secrets"]   = extract_secrets(text, js_url)
+    result["params"]      = sorted({p["value"] for p in detailed})
+    result["endpoints"]   = extract_endpoints(text, base_url, domain)
+    result["secrets"]     = extract_secrets(text, js_url)
     result["lazy_chunks"] = extract_lazy_chunks(text, js_url, domain)
     return result
 
 
-def run(ctx, phase_num=5, total=9):
+def run(ctx: Context, phase_num=5, total=9):
     base_url = getattr(ctx, "canonical_url", None) or ctx.target_url
     domain   = urlparse(base_url).netloc.lstrip("www.")
 
@@ -307,7 +287,7 @@ def run(ctx, phase_num=5, total=9):
     all_results       = []
     global_params     = set()
     global_ep         = set()
-    param_map         = {}      # endpoint -> set of param names
+    param_map         = {}  # endpoint -> set of param names
     all_secrets       = []
     seen_js           = set(ctx.js_files)
     lazy_chunks_total = set()
@@ -339,7 +319,7 @@ def run(ctx, phase_num=5, total=9):
         all_results.append(r)
         _merge(r)
         if not ctx.silent and (r["params"] or r["endpoints"] or r["lazy_chunks"]):
-            sec_lbl   = f"  ★ {len(r['secrets'])} secrets"     if r["secrets"]     else ""
+            sec_lbl   = f"  ★ {len(r['secrets'])} secrets"       if r["secrets"]     else ""
             chunk_lbl = f"  +{len(r['lazy_chunks'])} lazy chunks" if r["lazy_chunks"] else ""
             ctx.log(
                 f"[js_extract]   {r['source']:12}  "
@@ -375,7 +355,6 @@ def run(ctx, phase_num=5, total=9):
 
     high_value = [p for p in ctx.js_global_params if p in HIGH_VALUE_PARAMS]
 
-    # Write flat lists — endpoints as a plain JSON array for easy consumption
     ctx.write_json("js_endpoints.json", ctx.js_endpoints)
     ctx.write_json("js_params.json", {
         "total_params": len(ctx.js_global_params),
