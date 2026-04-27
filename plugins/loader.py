@@ -31,10 +31,7 @@ from plugins.base import BasePlugin
 # Maps short TOML names → importable module paths for built-in plugins.
 # Add an entry here whenever a new built-in is created.
 _BUILTIN_REGISTRY: dict = {
-    # "mcp":         "plugins.builtin.mcp_plugin",
-    # "discord":     "plugins.builtin.discord_plugin",
-    # "telegram":    "plugins.builtin.telegram_plugin",
-    # "json_export": "plugins.builtin.json_export_plugin",
+    "mcp": "plugins.builtin.mcp_plugin",
 }
 
 
