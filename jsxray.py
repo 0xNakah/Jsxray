@@ -3,7 +3,6 @@
 JSXray — XSS Intelligence Engine
 Usage:
   python3 jsxray.py -t target.com [options]
-  python3 jsxray.py --read recon/target.com/20260427_224504
 """
 
 import argparse
@@ -80,7 +79,6 @@ Examples:
   python3 jsxray.py -t target.com --skip-phases deep
   python3 jsxray.py -t target.com --phases intake,robots,js_discovery,js_extract,endpoint_crawl,output
   python3 jsxray.py -t target.com --timeout 120
-  python3 jsxray.py --read recon/target.com/20260427_224504
         """
     )
     p.add_argument("-t", "--target",     default=None, help="Target domain or URL")
@@ -98,9 +96,6 @@ Examples:
                    help="Silent mode — only print compact phase summaries")
     p.add_argument("--no-dashboard",     action="store_true",
                    help="Skip launching the web dashboard")
-    p.add_argument("--read",             default=None, metavar="SCAN_DIR",
-                   help="Load and display results from an existing scan directory\n"
-                        "e.g. --read recon/target.com/20260427_224504")
     return p.parse_args()
 
 
@@ -159,13 +154,8 @@ def launch_dashboard(workspace, port):
 def main():
     args = parse_args()
 
-    if args.read:
-        from core.reader import read_scan
-        read_scan(args.read)
-        sys.exit(0)
-
     if not args.target:
-        print("[jsxray] Error: -t/--target is required unless using --read")
+        print("[jsxray] Error: -t/--target is required")
         sys.exit(1)
 
     config = load_config(args.config)
