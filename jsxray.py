@@ -4,11 +4,17 @@ JSXray — XSS Intelligence Engine
 Usage: python3 jsxray.py -t target.com [options]
 """
 
-import argparse, sys, os, time, threading, webbrowser
+import argparse, sys, os, time, threading, webbrowser, atexit
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core.context import Context
 from core.config  import load_config, get_phases_for_mode
+from plugins.loader import (
+    load_plugins,
+    run_plugins_on_context_ready,
+    run_plugins_post_scan,
+    teardown_plugins,
+)
 
 VALID_PHASES = [
     "intake", "subdomains", "robots", "urls",
@@ -128,6 +134,11 @@ def main():
     phases = build_phase_list(args, config)
     total  = len(phases)
 
+    # ── Load plugins ──────────────────────────────────────────────────────────
+    plugins = load_plugins(config)
+    atexit.register(teardown_plugins, plugins)
+    # ─────────────────────────────────────────────────────────────────────────
+
     ctx = Context(
         target     = args.target,
         mode       = args.mode,
@@ -148,11 +159,22 @@ def main():
             print(f"\n[{i}/{total}] ── {phase.upper()} {'─'*40}")
         ctx = run_phase(phase, ctx, phase_num=i, total=total)
 
+        # ── Plugin hook: right after intake ───────────────────────────────────
+        if phase == "intake":
+            run_plugins_on_context_ready(plugins, ctx)
+        # ─────────────────────────────────────────────────────────────────────
+
     elapsed = time.time() - t0
     print(f"\n[jsxray] Done in {elapsed:.1f}s  →  {ctx.workspace}/")
 
     if ctx.failed_phases:
         print(f"[jsxray] ⚠  Failed phases: {', '.join(ctx.failed_phases)}")
+
+    # ── Plugin hook: post-scan ────────────────────────────────────────────────
+    if plugins:
+        print(f"\n[jsxray] Running {len(plugins)} plugin(s)...")
+        run_plugins_post_scan(plugins, ctx)
+    # ─────────────────────────────────────────────────────────────────────────
 
     if not args.no_dashboard:
         port = config["defaults"].get("port", 5000)
