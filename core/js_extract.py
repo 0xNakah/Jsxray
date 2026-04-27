@@ -3,42 +3,37 @@ js_extract.py — JS Parameter & Endpoint Extraction
 
 Uses the AST v5 extraction module (ast_extract.py) for parameter discovery.
 Endpoint, secret, sourcemap, and lazy-chunk extraction remain here.
-
-Confidence threading (fix #4):
-  extract_params_detailed() returns {value, confidence, source} per param.
-  HIGH confidence params (structural AST hits: req.query.foo, URLSearchParams.get,
-  FormData.append, etc.) are stored separately in ctx.js_high_confidence_params
-  and written to js_params_high_confidence.txt for use by deep.py and output.py.
 """
 
-import re, requests, json
+import re
+import json
+import requests
 from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from core.context import Context
 from core.ast_extract import extract_params_detailed, extract_params
 
 HEADERS = {
-    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept":          "*/*",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept":     "*/*",
 }
 
 HIGH_VALUE_PARAMS = {
-    "redirect","redirect_uri","redirect_url","redirecturl","redirecturi",
-    "return","returnurl","returnuri","return_url","return_uri",
-    "next","continue","forward","goto","dest","destination",
-    "target","ref","referer","referrer","back","location","url","uri",
-    "q","query","search","keyword","keywords","term","terms","text",
-    "input","msg","message","content","comment","description","title",
-    "subject","body","note","name","value","data","payload",
-    "template","view","page","layout","format","theme","style",
-    "lang","language","locale","currency","country","region",
-    "debug","test","preview","mode","dev","verbose","trace",
-    "token","state","code","nonce","scope","response_type",
-    "file","filename","path","dir","folder","upload","attachment",
-    "callback","cb","jsonp","handler","fn",
+    "redirect", "redirect_uri", "redirect_url", "redirecturl", "redirecturi",
+    "return", "returnurl", "returnuri", "return_url", "return_uri",
+    "next", "continue", "forward", "goto", "dest", "destination",
+    "target", "ref", "referer", "referrer", "back", "location", "url", "uri",
+    "q", "query", "search", "keyword", "keywords", "term", "terms", "text",
+    "input", "msg", "message", "content", "comment", "description", "title",
+    "subject", "body", "note", "name", "value", "data", "payload",
+    "template", "view", "page", "layout", "format", "theme", "style",
+    "lang", "language", "locale", "currency", "country", "region",
+    "debug", "test", "preview", "mode", "dev", "verbose", "trace",
+    "token", "state", "code", "nonce", "scope", "response_type",
+    "file", "filename", "path", "dir", "folder", "upload", "attachment",
+    "callback", "cb", "jsonp", "handler", "fn",
 }
 
-# Noise param filter — used by endpoint_crawl.py and internally
 _NOISE_PARAM_RE = re.compile(
     r"^(?:__\w+|ng-\w+|v-\w+|data-\w+|aria-\w+|on\w{2,}|\d+|\w{1,2})$",
     re.IGNORECASE,
@@ -50,8 +45,8 @@ _NOISE_VALUES = {
     "constructor", "__proto__", "hasownproperty",
 }
 
+
 def is_noise_param(name: str) -> bool:
-    """Return True if the param name looks like noise and should be filtered out."""
     if not name or len(name) > 60:
         return True
     cleaned = name.strip().lower()
@@ -171,17 +166,14 @@ def fetch_source_map(map_url, timeout, ua):
         if r.status_code != 200:
             return ""
         data = r.json()
-
         sources_content = data.get("sourcesContent", [])
         combined = "\n\n".join(s for s in sources_content if s and isinstance(s, str))
         if combined:
             return combined
-
         sources = data.get("sources", [])
         hint_text = _sources_to_hint_text(sources)
         if hint_text:
             return hint_text
-
         return r.text
     except Exception:
         pass
@@ -196,8 +188,7 @@ def _is_valid_endpoint(url: str) -> bool:
         netloc = p.netloc.split(":")[0]
         if not netloc or "." not in netloc:
             return False
-        tld = netloc.rsplit(".", 1)[-1]
-        if len(tld) < 2:
+        if len(netloc.rsplit(".", 1)[-1]) < 2:
             return False
         return True
     except Exception:
@@ -206,8 +197,7 @@ def _is_valid_endpoint(url: str) -> bool:
 
 def _is_in_scope_endpoint(url: str, domain: str) -> bool:
     try:
-        host = urlparse(url).netloc
-        return _host_in_scope(host, domain)
+        return _host_in_scope(urlparse(url).netloc, domain)
     except Exception:
         return False
 
@@ -216,13 +206,10 @@ def _looks_like_chunk_path(path: str) -> bool:
     if not path or "${" in path:
         return False
     lp = path.lower()
-    return (
-        lp.endswith(".js") and (
-            "chunk" in lp or "/static/" in lp or "/assets/" in lp or "/js/" in lp or "/chunks/" in lp or
-            lp.startswith("./") or lp.startswith("../") or lp.startswith("/") or
-            lp.startswith("static/") or lp.startswith("assets/") or lp.startswith("js/") or
-            lp.startswith("chunks/") or lp.startswith("_next/") or lp.startswith("public/")
-        )
+    return lp.endswith(".js") and (
+        "chunk" in lp or "/static/" in lp or "/assets/" in lp or "/js/" in lp
+        or "/chunks/" in lp or lp.startswith(("./", "../", "/", "static/",
+        "assets/", "js/", "chunks/", "_next/", "public/", "dist/", "build/", "bundle/"))
     )
 
 
@@ -233,8 +220,7 @@ def _resolve_chunk_ref(ref: str, current_js_url: str) -> str:
     )
     if any(ref.startswith(p) for p in ASSET_PREFIXES):
         parsed = urlparse(current_js_url)
-        origin = f"{parsed.scheme}://{parsed.netloc}"
-        return origin + "/" + ref
+        return f"{parsed.scheme}://{parsed.netloc}/{ref}"
     return urljoin(current_js_url, ref)
 
 
@@ -245,10 +231,7 @@ def extract_endpoints(text, base_url, domain):
             raw = m.group(1).strip()
             if "${" in raw:
                 continue
-            if raw.startswith("http"):
-                url = raw
-            else:
-                url = urljoin(base_url, raw)
+            url = raw if raw.startswith("http") else urljoin(base_url, raw)
             if _is_valid_endpoint(url) and _is_in_scope_endpoint(url, domain):
                 endpoints.add(url)
     return list(endpoints)
@@ -274,25 +257,19 @@ def extract_secrets(text, js_url):
             match_str = m.group(0)
             if re.match(r"^[xX\*<>{}|]+$", match_str):
                 continue
-            secrets.append({
-                "url":   js_url,
-                "type":  name,
-                "match": match_str[:120],
-            })
+            secrets.append({"url": js_url, "type": name, "match": match_str[:120]})
     return secrets
 
 
 def process_js_file(js_url, map_url, base_url, domain, timeout, ua):
     result = {
-        "url":          js_url,
-        "map_url":      map_url,
-        "endpoints":    [],
-        "params":       [],        # flat list of param name strings (all confidence)
-        "params_high":  [],        # flat list of HIGH confidence param name strings
-        "param_detail": [],        # full [{value, confidence, source}] list
-        "secrets":      [],
-        "lazy_chunks":  [],
-        "source":       "js",
+        "url":         js_url,
+        "map_url":     map_url,
+        "endpoints":   [],
+        "params":      [],
+        "secrets":     [],
+        "lazy_chunks": [],
+        "source":      "js",
     }
 
     if map_url:
@@ -307,14 +284,10 @@ def process_js_file(js_url, map_url, base_url, domain, timeout, ua):
     if not text:
         return result
 
-    # AST extraction via ast_extract — keeps full detail for confidence threading
     detailed = extract_params_detailed(text)
-    result["param_detail"] = detailed
-    result["params"]      = sorted({p["value"] for p in detailed})
-    result["params_high"] = sorted({p["value"] for p in detailed if p.get("confidence") == "HIGH"})
-
-    result["endpoints"]   = extract_endpoints(text, base_url, domain)
-    result["secrets"]     = extract_secrets(text, js_url)
+    result["params"]    = sorted({p["value"] for p in detailed})
+    result["endpoints"] = extract_endpoints(text, base_url, domain)
+    result["secrets"]   = extract_secrets(text, js_url)
     result["lazy_chunks"] = extract_lazy_chunks(text, js_url, domain)
     return result
 
@@ -329,139 +302,106 @@ def run(ctx, phase_num=5, total=9):
         ctx.log_phase_done(phase_num, total, "js_extract", "0 JS files")
         return ctx
 
-    ctx.log(
-        f"[js_extract] Processing {len(ctx.js_files)} JS files "
-        f"({len(ctx.source_maps)} with source maps)..."
-    )
+    ctx.log(f"[js_extract] Processing {len(ctx.js_files)} JS files ({len(ctx.source_maps)} with source maps)...")
 
     all_results       = []
     global_params     = set()
-    global_high       = set()   # HIGH confidence only
     global_ep         = set()
     param_map         = {}      # endpoint -> set of param names
-    param_map_high    = {}      # endpoint -> set of HIGH confidence param names
     all_secrets       = []
     seen_js           = set(ctx.js_files)
     lazy_chunks_total = set()
 
     def _process_batch(js_urls):
-        batch_results = []
+        results = []
         with ThreadPoolExecutor(max_workers=20) as ex:
             futures = {
                 ex.submit(
-                    process_js_file,
-                    js_url,
-                    ctx.source_maps.get(js_url),
-                    base_url,
-                    domain,
-                    ctx.timeout,
-                    ctx.user_agent,
+                    process_js_file, js_url, ctx.source_maps.get(js_url),
+                    base_url, domain, ctx.timeout, ctx.user_agent,
                 ): js_url
                 for js_url in js_urls
             }
             for fut in as_completed(futures):
-                batch_results.append(fut.result())
-        return batch_results
+                results.append(fut.result())
+        return results
 
     def _merge(r):
         global_params.update(r["params"])
-        global_high.update(r["params_high"])
         global_ep.update(r["endpoints"])
         all_secrets.extend(r["secrets"])
         lazy_chunks_total.update(r["lazy_chunks"])
         for ep in r["endpoints"]:
             param_map.setdefault(ep, set()).update(r["params"])
-            if r["params_high"]:
-                param_map_high.setdefault(ep, set()).update(r["params_high"])
 
     first_pass = _process_batch(ctx.js_files)
     for r in first_pass:
         all_results.append(r)
         _merge(r)
         if not ctx.silent and (r["params"] or r["endpoints"] or r["lazy_chunks"]):
-            high_lbl  = f"  [{len(r['params_high'])} HIGH]" if r["params_high"] else ""
-            sec_lbl   = f"  \u2605 {len(r['secrets'])} secrets" if r["secrets"] else ""
+            sec_lbl   = f"  ★ {len(r['secrets'])} secrets"     if r["secrets"]     else ""
             chunk_lbl = f"  +{len(r['lazy_chunks'])} lazy chunks" if r["lazy_chunks"] else ""
             ctx.log(
                 f"[js_extract]   {r['source']:12}  "
-                f"{len(r['params']):3} params{high_lbl}  "
-                f"{len(r['endpoints']):3} endpoints{sec_lbl}{chunk_lbl}"
-                f"  {r['url']}"
+                f"{len(r['params']):3} params  "
+                f"{len(r['endpoints']):3} endpoints{sec_lbl}{chunk_lbl}  {r['url']}"
             )
 
+    # Second pass — lazy-loaded chunks (1 level deep, skip already-seen)
     new_chunks = [u for u in sorted(lazy_chunks_total) if u not in seen_js]
     if new_chunks:
         ctx.log(f"[js_extract] Processing {len(new_chunks)} lazy-loaded chunks (1-level deep)...")
-        second_pass = _process_batch(new_chunks)
         seen_js.update(new_chunks)
-        for r in second_pass:
+        for r in _process_batch(new_chunks):
             all_results.append(r)
             _merge(r)
             if not ctx.silent and (r["params"] or r["endpoints"]):
-                high_lbl = f"  [{len(r['params_high'])} HIGH]" if r["params_high"] else ""
-                sec_lbl  = f"  \u2605 {len(r['secrets'])} secrets" if r["secrets"] else ""
+                sec_lbl = f"  ★ {len(r['secrets'])} secrets" if r["secrets"] else ""
                 ctx.log(
                     f"[js_extract]   {r['source']:12}  "
-                    f"{len(r['params']):3} params{high_lbl}  "
-                    f"{len(r['endpoints']):3} endpoints{sec_lbl}"
-                    f"  {r['url']}"
+                    f"{len(r['params']):3} params  "
+                    f"{len(r['endpoints']):3} endpoints{sec_lbl}  {r['url']}"
                 )
 
-    inline_eps    = getattr(ctx, "inline_script_endpoints", [])
-    inline_params = getattr(ctx, "inline_script_params",    [])
-    global_ep.update(inline_eps)
-    global_params.update(inline_params)
+    # Merge any inline script data collected by js_discovery
+    global_ep.update(getattr(ctx, "inline_script_endpoints", []))
+    global_params.update(getattr(ctx, "inline_script_params", []))
 
-    ctx.js_files                = sorted(seen_js)
-    ctx.js_global_params        = sorted(global_params)
-    ctx.js_high_confidence_params = sorted(global_high)
-    ctx.js_endpoints            = sorted(global_ep)
-    ctx.js_param_map            = {ep: sorted(p)  for ep, p in param_map.items()}
-    ctx.js_param_map_high       = {ep: sorted(p)  for ep, p in param_map_high.items()}
-    ctx.js_file_data            = all_results
+    ctx.js_files         = sorted(seen_js)
+    ctx.js_global_params = sorted(global_params)
+    ctx.js_endpoints     = sorted(global_ep)
+    ctx.js_param_map     = {ep: sorted(p) for ep, p in param_map.items()}
+    ctx.js_file_data     = all_results
 
     high_value = [p for p in ctx.js_global_params if p in HIGH_VALUE_PARAMS]
-    high_value_confident = [p for p in ctx.js_high_confidence_params if p in HIGH_VALUE_PARAMS]
 
+    # Write flat lists — endpoints as a plain JSON array for easy consumption
+    ctx.write_json("js_endpoints.json", ctx.js_endpoints)
     ctx.write_json("js_params.json", {
-        "total_params":          len(ctx.js_global_params),
-        "total_high_confidence": len(ctx.js_high_confidence_params),
-        "high_value":            high_value,
-        "high_value_confident":  high_value_confident,
-        "all_params":            ctx.js_global_params,
-        "high_confidence":       ctx.js_high_confidence_params,
-        "by_endpoint":           ctx.js_param_map,
-        "by_endpoint_high":      ctx.js_param_map_high,
+        "total_params": len(ctx.js_global_params),
+        "high_value":   high_value,
+        "all_params":   ctx.js_global_params,
+        "by_endpoint":  ctx.js_param_map,
     })
-    ctx.write_json("js_endpoints.json", {
-        "total":     len(ctx.js_endpoints),
-        "endpoints": ctx.js_endpoints,
-    })
-    ctx.write_text("js_params_flat.txt",            "\n".join(ctx.js_global_params))
-    ctx.write_text("js_params_high_confidence.txt", "\n".join(ctx.js_high_confidence_params))
-    ctx.write_text("js_endpoints_flat.txt",         "\n".join(ctx.js_endpoints))
-    ctx.write_text("js_files.txt",                  "\n".join(ctx.js_files))
+    ctx.write_text("js_params_flat.txt",    "\n".join(ctx.js_global_params))
+    ctx.write_text("js_endpoints_flat.txt", "\n".join(ctx.js_endpoints))
+    ctx.write_text("js_files.txt",          "\n".join(ctx.js_files))
 
     if lazy_chunks_total:
-        ctx.write_json("lazy_chunks.json", {
-            "total":  len(lazy_chunks_total),
-            "chunks": sorted(lazy_chunks_total),
-        })
+        ctx.write_json("lazy_chunks.json", sorted(lazy_chunks_total))
 
     if all_secrets:
         ctx.write_json("js_secrets_hints.json", all_secrets)
-        ctx.log(f"[js_extract]   {len(all_secrets)} potential secrets \u2192 js_secrets_hints.json")
+        ctx.log(f"[js_extract]   {len(all_secrets)} potential secrets → js_secrets_hints.json")
 
-    if high_value_confident and not ctx.silent:
-        ctx.log(f"[js_extract]   HIGH confidence high-value params: {', '.join(high_value_confident[:20])}")
-    elif high_value and not ctx.silent:
+    if high_value and not ctx.silent:
         ctx.log(f"[js_extract]   High-value params: {', '.join(high_value[:20])}")
 
     ctx.phases_run.append("js_extract")
     ctx.log_phase_done(
         phase_num, total, "js_extract",
         f"{len(ctx.js_files)} JS files | "
-        f"{len(ctx.js_global_params)} params ({len(ctx.js_high_confidence_params)} HIGH) | "
+        f"{len(ctx.js_global_params)} params | "
         f"{len(high_value)} high-value | "
         f"{len(ctx.js_endpoints)} endpoints | "
         f"{len(all_secrets)} secret hints | "

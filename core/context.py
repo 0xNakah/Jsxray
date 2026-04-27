@@ -1,4 +1,6 @@
-import os, json
+import os
+import json
+import time
 from datetime import datetime
 from dataclasses import dataclass, field
 
@@ -6,12 +8,12 @@ from dataclasses import dataclass, field
 @dataclass
 class Context:
     # ── Identity ──────────────────────────────────────────────────────────────
-    target:        str = ""
-    target_url:    str = ""
-    canonical_url: str = ""   # real live base after redirect detection
-    timestamp:     str = field(default_factory=lambda: datetime.now().strftime("%Y%m%d_%H%M%S"))
-    workspace:     str = ""
-    mode:          str = "standard"
+    target:        str  = ""
+    target_url:    str  = ""
+    canonical_url: str  = ""   # real live base after redirect detection
+    timestamp:     str  = field(default_factory=lambda: datetime.now().strftime("%Y%m%d_%H%M%S"))
+    workspace:     str  = ""
+    mode:          str  = "standard"
     phases:        list = field(default_factory=list)
     config:        dict = field(default_factory=dict)
     timeout:       int  = 10
@@ -53,15 +55,18 @@ class Context:
     phases_run:       list = field(default_factory=list)
     failed_phases:    list = field(default_factory=list)
     errors:           list = field(default_factory=list)
-    scan_start:       float = field(default_factory=lambda: __import__('time').time())
+    scan_start:       float = field(default_factory=time.time)
 
     # ─────────────────────────────────────────────────────────────────────────
 
     def setup_workspace(self, base_dir="recon"):
-        safe = (self.target
-                .replace("https://", "")
-                .replace("http://", "")
-                .replace("/", "_"))
+        safe = (
+            self.target
+            .replace("https://", "")
+            .replace("http://", "")
+            .replace("/", "_")
+            .rstrip("_")
+        )
         self.workspace = os.path.join(base_dir, safe, self.timestamp)
         os.makedirs(self.workspace, exist_ok=True)
         return self.workspace
@@ -89,7 +94,6 @@ class Context:
         self.errors.append({"phase": phase, "error": str(error)})
 
     def elapsed(self):
-        import time
         return round(time.time() - self.scan_start, 1)
 
     def to_summary(self):

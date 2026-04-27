@@ -6,7 +6,15 @@ Usage:
   python3 jsxray.py --read recon/target.com/20260427_224504
 """
 
-import argparse, sys, os, time, threading, webbrowser, atexit
+import argparse
+import importlib
+import os
+import sys
+import time
+import threading
+import webbrowser
+import atexit
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core.context import Context
@@ -24,17 +32,29 @@ VALID_PHASES = [
 ]
 
 PHASE_MAP = {
-    "intake":          "core.intake",
-    "subdomains":      "core.subdomains",
-    "robots":          "core.robots",
-    "urls":            "core.urls",
-    "js_discovery":    "core.js_discovery",
-    "js_extract":      "core.js_extract",
-    "endpoint_crawl":  "core.endpoint_crawl",
-    "deep":            "core.deep",
-    "crawl":           "core.crawl",
-    "output":          "core.output",
+    "intake":         "core.intake",
+    "subdomains":     "core.subdomains",
+    "robots":         "core.robots",
+    "urls":           "core.urls",
+    "js_discovery":   "core.js_discovery",
+    "js_extract":     "core.js_extract",
+    "endpoint_crawl": "core.endpoint_crawl",
+    "deep":           "core.deep",
+    "crawl":          "core.crawl",
+    "output":         "core.output",
 }
+
+# Pre-load all phase modules once at startup so importlib isn't called per phase
+_PHASE_MODULES = {}
+
+
+def _preload_phases():
+    for phase, mod_path in PHASE_MAP.items():
+        try:
+            _PHASE_MODULES[phase] = importlib.import_module(mod_path)
+        except Exception:
+            pass  # missing optional phases are fine
+
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -63,14 +83,14 @@ Examples:
   python3 jsxray.py --read recon/target.com/20260427_224504
         """
     )
-    p.add_argument("-t", "--target",     default=None,   help="Target domain or URL")
+    p.add_argument("-t", "--target",     default=None, help="Target domain or URL")
     p.add_argument("-m", "--mode",       default="standard",
                    choices=["quick", "standard", "full"],
                    help="Scan mode (default: standard)")
     p.add_argument("--phases",           help="Explicit comma-separated phase list (overrides mode)")
     p.add_argument("--skip-phases",      help="Comma-separated phases to skip")
-    p.add_argument("-o", "--output-dir", default=None,   help="Output directory (default: recon/)")
-    p.add_argument("--config",           default=None,   help="Path to jsxray.toml")
+    p.add_argument("-o", "--output-dir", default=None, help="Output directory (default: recon/)")
+    p.add_argument("--config",           default=None, help="Path to jsxray.toml")
     p.add_argument("--port",             type=int, default=None, help="Dashboard port (default: 5000)")
     p.add_argument("--timeout",          type=int, default=None,
                    help="HTTP timeout in seconds (default: 60)")
@@ -78,10 +98,11 @@ Examples:
                    help="Silent mode — only print compact phase summaries")
     p.add_argument("--no-dashboard",     action="store_true",
                    help="Skip launching the web dashboard")
-    p.add_argument("--read",             default=None,   metavar="SCAN_DIR",
+    p.add_argument("--read",             default=None, metavar="SCAN_DIR",
                    help="Load and display results from an existing scan directory\n"
                         "e.g. --read recon/target.com/20260427_224504")
     return p.parse_args()
+
 
 def build_phase_list(args, config):
     if args.phases:
@@ -93,34 +114,39 @@ def build_phase_list(args, config):
         skip   = {p.strip() for p in args.skip_phases.split(",")}
         phases = [p for p in phases if p not in skip]
 
-    if "intake" not in phases:  phases.insert(0, "intake")
-    if "output" not in phases:  phases.append("output")
+    if "intake" not in phases:
+        phases.insert(0, "intake")
+    if "output" not in phases:
+        phases.append("output")
     return phases
 
+
 def run_phase(phase_name, ctx, phase_num, total):
-    module_path = PHASE_MAP.get(phase_name)
-    if not module_path:
-        print(f"[jsxray] Unknown phase: {phase_name} — skipping")
+    module = _PHASE_MODULES.get(phase_name)
+    if module is None:
+        print(f"[jsxray] Unknown or unloaded phase: {phase_name} — skipping")
         return ctx
     try:
-        import importlib
-        module = importlib.import_module(module_path)
-        ctx    = module.run(ctx, phase_num=phase_num, total=total)
+        ctx = module.run(ctx, phase_num=phase_num, total=total)
     except Exception as e:
+        import traceback
         print(f"[jsxray] Phase '{phase_name}' failed: {e}")
-        import traceback; traceback.print_exc()
+        traceback.print_exc()
         ctx.log_error(phase_name, str(e))
         ctx.failed_phases.append(phase_name)
     return ctx
+
 
 def launch_dashboard(workspace, port):
     try:
         from dashboard.server import create_app
         recon_dir = os.path.dirname(os.path.dirname(workspace))
         app       = create_app(recon_dir=recon_dir)
+
         def open_browser():
             time.sleep(1.2)
             webbrowser.open(f"http://localhost:{port}")
+
         threading.Thread(target=open_browser, daemon=True).start()
         print(f"[jsxray] Dashboard → http://localhost:{port}  (Ctrl+C to stop)\n")
         app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
@@ -129,15 +155,14 @@ def launch_dashboard(workspace, port):
     except OSError as e:
         print(f"[jsxray] Dashboard failed on port {port}: {e}")
 
-def main():
-    args   = parse_args()
 
-    # ── --read mode: display existing scan results, then exit ─────────────────
+def main():
+    args = parse_args()
+
     if args.read:
         from core.reader import read_scan
         read_scan(args.read)
         sys.exit(0)
-    # ─────────────────────────────────────────────────────────────────────────
 
     if not args.target:
         print("[jsxray] Error: -t/--target is required unless using --read")
@@ -152,10 +177,10 @@ def main():
     phases = build_phase_list(args, config)
     total  = len(phases)
 
-    # ── Load plugins ──────────────────────────────────────────────────────────
+    _preload_phases()
+
     plugins = load_plugins(config)
     atexit.register(teardown_plugins, plugins)
-    # ─────────────────────────────────────────────────────────────────────────
 
     ctx = Context(
         target     = args.target,
@@ -171,32 +196,26 @@ def main():
     print(f"[jsxray] Mode   : {args.mode}  (phases: {', '.join(phases)})")
     print(f"[jsxray] Timeout: {ctx.timeout}s\n")
 
-    t0 = time.time()
     for i, phase in enumerate(phases, 1):
         if not args.silent:
             print(f"\n[{i}/{total}] ── {phase.upper()} {'─'*40}")
         ctx = run_phase(phase, ctx, phase_num=i, total=total)
-
-        # ── Plugin hook: right after intake ───────────────────────────────────
         if phase == "intake":
             run_plugins_on_context_ready(plugins, ctx)
-        # ─────────────────────────────────────────────────────────────────────
 
-    elapsed = time.time() - t0
-    print(f"\n[jsxray] Done in {elapsed:.1f}s  →  {ctx.workspace}/")
+    print(f"\n[jsxray] Done in {ctx.elapsed()}s  →  {ctx.workspace}/")
 
     if ctx.failed_phases:
         print(f"[jsxray] ⚠  Failed phases: {', '.join(ctx.failed_phases)}")
 
-    # ── Plugin hook: post-scan ────────────────────────────────────────────────
     if plugins:
         print(f"\n[jsxray] Running {len(plugins)} plugin(s)...")
         run_plugins_post_scan(plugins, ctx)
-    # ─────────────────────────────────────────────────────────────────────────
 
     if not args.no_dashboard:
         port = config["defaults"].get("port", 5000)
         launch_dashboard(ctx.workspace, port)
+
 
 if __name__ == "__main__":
     main()

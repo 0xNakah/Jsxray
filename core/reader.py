@@ -53,7 +53,7 @@ def _print_summary(workspace: Path):
         return
     print(f"  Target   : {data.get('target', 'unknown')}")
     print(f"  Mode     : {data.get('mode', 'unknown')}")
-    print(f"  Elapsed  : {data.get('elapsed', '?')}s")
+    print(f"  Elapsed  : {data.get('elapsed_s', '?')}s")
     print(f"  Workspace: {workspace}")
     s = data.get("stats", {})
     if s:
@@ -67,6 +67,8 @@ def _print_summary(workspace: Path):
         print(f"  Endpoints  : {s.get('js_endpoints', 0)} extracted")
         print(f"  Params     : {s.get('js_global_params', 0)} extracted  "
               f"(+{s.get('hidden_params', 0)} hidden)")
+        if s.get('secret_hints'):
+            print(f"  Secrets    : {s['secret_hints']} hints found")
     tech = data.get("tech_stack")
     if tech:
         _sep()
@@ -75,60 +77,61 @@ def _print_summary(workspace: Path):
 
 
 def _print_secrets(workspace: Path):
-    secrets = _load_json(workspace / "secrets.json")
-    hints   = _load_json(workspace / "js_secrets_hints.json")
+    secrets = _load_json(workspace / "secrets.json") or []
+    hints   = _load_json(workspace / "js_secrets_hints.json") or []
 
     print("\n🔑  SECRETS")
     _sep()
-    if not secrets:
+    if not secrets and not hints:
         print("  (none found)")
-    else:
-        for i, s in enumerate(secrets, 1):
-            print(f"  [{i}] type  : {s.get('type', '?').upper()}")
-            print(f"      file  : {_trunc(s.get('url', '?'), 90)}")
-            print(f"      match : {_trunc(s.get('match', '?'), 90)}")
-            print()
+        return
 
-    if hints:
-        low = [h for h in hints if h not in (secrets or [])]
-        if low:
-            print(f"  ⚠  {len(low)} lower-confidence hint(s) in js_secrets_hints.json — review manually")
+    # Deduplicate hints vs confirmed secrets
+    secret_keys = {(s.get("type"), s.get("match")) for s in secrets}
+    extra_hints = [h for h in hints if (h.get("type"), h.get("match")) not in secret_keys]
+
+    all_findings = secrets + extra_hints
+    for i, s in enumerate(all_findings, 1):
+        print(f"  [{i}] type  : {s.get('type', '?').upper()}")
+        print(f"      file  : {_trunc(s.get('url', '?'), 90)}")
+        print(f"      match : {_trunc(s.get('match', '?'), 90)}")
+        print()
 
 
 def _print_endpoints(workspace: Path):
-    js_eps   = _load_json(workspace / "js_endpoints.json") or []
-    crawl_ep = _load_json(workspace / "crawl_endpoints.json") or []
-    flat     = _load_text(workspace / "js_endpoints_flat.txt")
+    # js_endpoints.json is now a plain list
+    raw    = _load_json(workspace / "js_endpoints.json") or []
+    js_eps = raw if isinstance(raw, list) else raw.get("endpoints", [])
 
-    all_eps = list(dict.fromkeys(js_eps + crawl_ep))  # dedup, preserve order
+    crawl_raw = _load_json(workspace / "crawl_endpoints.json") or []
+    crawl_eps = crawl_raw if isinstance(crawl_raw, list) else crawl_raw.get("endpoints", [])
+
+    all_eps = list(dict.fromkeys(js_eps + crawl_eps))
 
     print("\n🌐  ENDPOINTS")
     _sep()
     if not all_eps:
         print("  (none found)")
-    else:
-        print(f"  {len(all_eps)} total  "
-              f"({len(js_eps)} from JS  /  {len(crawl_ep)} from crawl)\n")
-        for ep in all_eps:
-            print(f"  {_trunc(ep, 95)}")
+        return
+
+    print(f"  {len(all_eps)} total  ({len(js_eps)} from JS  /  {len(crawl_eps)} from crawl)\n")
+    for ep in all_eps:
+        print(f"  {_trunc(ep, 95)}")
 
 
 def _print_params(workspace: Path):
-    hc   = _load_text(workspace / "js_params_high_confidence.txt")
     flat = _load_text(workspace / "js_params_flat.txt")
 
     print("\n🎯  PARAMETERS")
     _sep()
-    if hc:
-        print("  High-confidence params:")
-        for line in hc.splitlines():
-            print(f"    {line}")
-    else:
-        print("  (no high-confidence params)")
+    if not flat:
+        print("  (none found)")
+        return
 
-    if flat and flat != hc:
-        all_params = flat.splitlines()
-        print(f"\n  All params ({len(all_params)} total) — see js_params_flat.txt")
+    params = flat.splitlines()
+    print(f"  {len(params)} params total\n")
+    for p in params:
+        print(f"    {p}")
 
 
 def _print_nuclei(workspace: Path):
@@ -137,29 +140,25 @@ def _print_nuclei(workspace: Path):
     _sep()
     if not data:
         print("  (none)")
-    else:
-        lines = [l for l in data.splitlines() if l and not l.startswith("#")]
-        print(f"  {len(lines)} targets — run with:")
-        print(f"  nuclei -l {workspace}/nuclei_targets.txt -t ~/nuclei-templates/ "
-              f"-severity medium,high,critical")
-        print()
-        for l in lines[:10]:
-            print(f"  {_trunc(l, 95)}")
-        if len(lines) > 10:
-            print(f"  … and {len(lines) - 10} more")
+        return
+    lines = [l for l in data.splitlines() if l and not l.startswith("#")]
+    print(f"  {len(lines)} targets — run with:")
+    print(f"  nuclei -l {workspace}/nuclei_targets.txt -t ~/nuclei-templates/ -severity medium,high,critical\n")
+    for l in lines[:10]:
+        print(f"  {_trunc(l, 95)}")
+    if len(lines) > 10:
+        print(f"  … and {len(lines) - 10} more")
 
 
 def _print_robots(workspace: Path):
-    robots = _load_json(workspace / "robots_paths.json")
+    robots = _load_json(workspace / "robots_paths.json") or []
     print("\n🤖  ROBOTS.TXT PATHS")
     _sep()
     if not robots:
         print("  (none)")
-    else:
-        for entry in robots:
-            status = entry.get("status", "?")
-            url    = entry.get("url", "?")
-            print(f"  [{status}]  {_trunc(url, 90)}")
+        return
+    for entry in robots:
+        print(f"  [{entry.get('status', '?')}]  {_trunc(entry.get('url', '?'), 90)}")
 
 
 # ── Main entry ────────────────────────────────────────────────────────────────
