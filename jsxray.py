@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 JSXray — XSS Intelligence Engine
-Usage: python3 jsxray.py -t target.com [options]
+Usage:
+  python3 jsxray.py -t target.com [options]
+  python3 jsxray.py --read recon/target.com/20260427_224504
 """
 
 import argparse, sys, os, time, threading, webbrowser, atexit
@@ -58,9 +60,10 @@ Examples:
   python3 jsxray.py -t target.com --skip-phases deep
   python3 jsxray.py -t target.com --phases intake,robots,js_discovery,js_extract,endpoint_crawl,output
   python3 jsxray.py -t target.com --timeout 120
+  python3 jsxray.py --read recon/target.com/20260427_224504
         """
     )
-    p.add_argument("-t", "--target",     required=True,  help="Target domain or URL")
+    p.add_argument("-t", "--target",     default=None,   help="Target domain or URL")
     p.add_argument("-m", "--mode",       default="standard",
                    choices=["quick", "standard", "full"],
                    help="Scan mode (default: standard)")
@@ -75,6 +78,9 @@ Examples:
                    help="Silent mode — only print compact phase summaries")
     p.add_argument("--no-dashboard",     action="store_true",
                    help="Skip launching the web dashboard")
+    p.add_argument("--read",             default=None,   metavar="SCAN_DIR",
+                   help="Load and display results from an existing scan directory\n"
+                        "e.g. --read recon/target.com/20260427_224504")
     return p.parse_args()
 
 def build_phase_list(args, config):
@@ -125,6 +131,18 @@ def launch_dashboard(workspace, port):
 
 def main():
     args   = parse_args()
+
+    # ── --read mode: display existing scan results, then exit ─────────────────
+    if args.read:
+        from core.reader import read_scan
+        read_scan(args.read)
+        sys.exit(0)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    if not args.target:
+        print("[jsxray] Error: -t/--target is required unless using --read")
+        sys.exit(1)
+
     config = load_config(args.config)
 
     if args.output_dir: config["defaults"]["output_dir"] = args.output_dir
