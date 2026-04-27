@@ -16,6 +16,10 @@
  *   - Dynamic computed string keys via string-constant folding
  *   - @babel/parser fallback for TS/JSX/minified parse failures
  *   - isValidParam floor raised to 2 chars (with q/s/v/t/id whitelist)
+ *
+ * v5.2:
+ *   - Route path param extraction: /:param and /[param] patterns in string literals
+ *     Covers Express, React Router, Next.js, Vue Router, and generic path strings.
  */
 
 'use strict';
@@ -110,13 +114,59 @@ const JS_BUILTINS = new Set([
   'get', 'set', 'has', 'delete', 'getAll', 'append',
 ]);
 
+// ── Route path param patterns ─────────────────────────────────────────────────
+//
+// Matches any string literal that looks like a URL path with named segments:
+//   Express / React Router / Vue Router:  /:param_name
+//   Next.js / Nuxt (file-based):          /[param_name]  or  /[[param_name]]
+//
+// Guard: the string must start with / or contain at least one / before the
+// param token, so we don't fire on arbitrary strings that happen to contain
+// a colon (e.g. "http://host", CSS "color: red").
+
+const ROUTE_PATH_RE     = /\/:([ a-zA-Z_][a-zA-Z0-9_]{1,59})/g;  // /:param
+const NEXT_BRACKET_RE   = /\/\[\[?([a-zA-Z_][a-zA-Z0-9_]{1,59})\]\]?/g; // /[param] or /[[param]]
+
+/**
+ * Return true when a string literal value looks like it could be a route path.
+ * Must start with / OR contain a segment separator before a : or [ token.
+ * Filters out http(s):// URLs and CSS-like strings.
+ */
+function looksLikeRoutePath(str) {
+  if (!str || typeof str !== 'string') return false;
+  if (str.length > 300) return false;
+  // Must contain a slash before any : or [ param token
+  if (!/\/(?::|\[)/.test(str)) return false;
+  // Reject full URLs — they are handled by the endpoint extractor
+  if (/^https?:\/\//.test(str)) return false;
+  return true;
+}
+
+/**
+ * extractRouteParams — pull /:name and /[name] segments from a path string.
+ * Returns an array of param name strings.
+ */
+function extractRouteParams(str) {
+  const names = [];
+  let m;
+  // Reset lastIndex before each use (regexes are stateful with /g flag)
+  ROUTE_PATH_RE.lastIndex = 0;
+  while ((m = ROUTE_PATH_RE.exec(str)) !== null) {
+    names.push(m[1]);
+  }
+  NEXT_BRACKET_RE.lastIndex = 0;
+  while ((m = NEXT_BRACKET_RE.exec(str)) !== null) {
+    names.push(m[1]);
+  }
+  return names;
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function calleeName(node) {
   if (!node) return null;
   if (node.type === 'Identifier') return node.name;
   if (node.type === 'MemberExpression') {
-    // handles: axios.get, this.$http.post, etc.
     const obj  = calleeName(node.object);
     const prop = node.property?.type === 'Identifier' ? node.property.name : null;
     if (obj && prop) return obj + '.' + prop;
@@ -134,17 +184,11 @@ function extractQS(urlStr) {
   }
 }
 
-/**
- * Collect all string-literal keys from an ObjectExpression,
- * including one level of SpreadElement if the spread target is itself
- * an ObjectExpression literal (handles { ...defaults, key: val }).
- */
 function objectLiteralKeys(objNode) {
   if (!objNode || objNode.type !== 'ObjectExpression') return [];
   const keys = [];
   for (const prop of objNode.properties) {
     if (prop.type === 'SpreadElement') {
-      // Unwrap one level: { ...{ a: 1, b: 2 } }
       if (prop.argument?.type === 'ObjectExpression') {
         keys.push(...objectLiteralKeys(prop.argument));
       }
@@ -157,10 +201,6 @@ function objectLiteralKeys(objNode) {
   return keys;
 }
 
-/**
- * Attempt to fold a node to a static string constant.
- * Covers: Literal, Identifier whose name matches known string vars (best-effort).
- */
 function foldToString(node, stringConsts) {
   if (!node) return null;
   if (node.type === 'Literal' && typeof node.value === 'string') return node.value;
@@ -168,10 +208,6 @@ function foldToString(node, stringConsts) {
   return null;
 }
 
-/**
- * isValidParam — raised floor to 2 chars with a small whitelist for
- * common single-char params (q, s, v, t, p, n, id).
- */
 function isValidParam(name) {
   if (!name || typeof name !== 'string') return false;
   if (name.length > 60) return false;
@@ -183,17 +219,14 @@ function isValidParam(name) {
   return true;
 }
 
-// ── Parser: acorn first, babel fallback ──────────────────────────────────────
+// ── Parser ────────────────────────────────────────────────────────────────────
 
 function tryParse(code) {
-  // Primary: acorn — fast, zero overhead
   for (const sourceType of ['module', 'script']) {
     try {
       return acorn.parse(code, { ecmaVersion: 2022, sourceType });
     } catch (_) {}
   }
-  // Fallback: @babel/parser — handles TypeScript, JSX, decorators,
-  // and errorRecovery keeps going on minified/partial code
   if (babelParser) {
     try {
       return babelParser.parse(code, {
@@ -213,7 +246,6 @@ function buildAliasMap(ast) {
   const urlParamAliases = new Set();
   const payloadAliases  = new Set();
   const directParams    = new Set();
-  // Map of variable name → literal string value (for dynamic key folding)
   const stringConsts    = new Map();
 
   walk.simple(ast, {
@@ -221,7 +253,6 @@ function buildAliasMap(ast) {
       if (!node.init) return;
       const init = node.init;
 
-      // Collect string constants: const KEY = 'api_token'
       if (
         node.id?.type === 'Identifier' &&
         init.type === 'Literal' &&
@@ -254,7 +285,6 @@ function buildAliasMap(ast) {
         if (isPayload) payloadAliases.add(node.id.name);
       }
 
-      // Destructure: const { user_id, token } = req.query
       if (node.id.type === 'ObjectPattern' && isQuery) {
         for (const prop of node.id.properties) {
           if (prop.type === 'RestElement') continue;
@@ -263,7 +293,6 @@ function buildAliasMap(ast) {
         }
       }
 
-      // Object.assign alias: const p = Object.assign({}, someQueryObj)
       if (
         node.id?.type === 'Identifier' &&
         init.type === 'CallExpression' &&
@@ -296,10 +325,10 @@ function extract(code) {
     CallExpression(n) { callSitePositions.add(n.callee.start); },
   });
 
-  const found    = [];
-  const seen     = new Set();
+  const found      = [];
+  const seen       = new Set();
   const endpoints  = [];
-  const seenEP   = new Set();
+  const seenEP     = new Set();
 
   function emit(value, confidence, source) {
     if (!isValidParam(value)) return;
@@ -315,15 +344,10 @@ function extract(code) {
     }
   }
 
-  /**
-   * Extract keys from an ObjectExpression that lives inside a net call body,
-   * including nested spread: fetch('/a', { ...opts, body: { secret: x } })
-   */
   function extractObjectArgKeys(objNode, source, confidence) {
     if (!objNode || objNode.type !== 'ObjectExpression') return;
     for (const prop of objNode.properties) {
       if (prop.type === 'SpreadElement') {
-        // Unwrap one level of spread object
         if (prop.argument?.type === 'ObjectExpression') {
           extractObjectArgKeys(prop.argument, source + '_spread', confidence);
         }
@@ -332,7 +356,6 @@ function extract(code) {
       if (!prop.key) continue;
       const k = prop.key.name || prop.key.value;
       if (!k) continue;
-      // Recurse into body/data/params sub-objects
       if (['params', 'data', 'body'].includes(k) && prop.value?.type === 'ObjectExpression') {
         for (const pk of objectLiteralKeys(prop.value)) emit(pk, 'HIGH', source + '_body');
       } else if (!FETCH_OPTION_KEYS.has(k)) {
@@ -346,12 +369,11 @@ function extract(code) {
 
   walk.simple(ast, {
 
-    // ── CallExpression handler ──────────────────────────────────────────────
+    // ── CallExpression ────────────────────────────────────────────────────────
     CallExpression(node) {
       const name = calleeName(node.callee);
       const args = node.arguments;
 
-      // ── Net calls: fetch, axios.*, got, ky, Vue this.$http.* ──────────────
       if (name && NET_CALLS.has(name) && args.length) {
         const first = args[0];
 
@@ -369,13 +391,11 @@ function extract(code) {
           }
         }
 
-        // All object args (options, body, config)
         for (const arg of args) {
           extractObjectArgKeys(arg, 'net_arg', 'HIGH');
         }
       }
 
-      // ── Object.assign({}, { key: val, ... }) ──────────────────────────────
       if (name === 'Object.assign') {
         for (const arg of args) {
           if (arg.type !== 'ObjectExpression') continue;
@@ -383,7 +403,6 @@ function extract(code) {
         }
       }
 
-      // ── React useState / useReducer / useForm initial state ───────────────
       if (
         node.callee.type === 'Identifier' &&
         REACT_STATE_HOOKS.has(node.callee.name) &&
@@ -401,20 +420,16 @@ function extract(code) {
         const isSPNew  = objNode?.type === 'NewExpression';
         const isQAlias = objName && queryAliases.has(objName);
 
-        // URLSearchParams / alias .set/.append/.get
         if ((isSP || isSPNew || isQAlias) && method && SP_METHODS.has(method)) {
-          // Static literal key
           if (args[0]?.type === 'Literal' && typeof args[0].value === 'string') {
             emit(args[0].value, 'HIGH', 'searchparam_call');
           }
-          // Dynamic key: const key = 'api_token'; sp.set(key, val)
           if (args[0]?.type === 'Identifier') {
             const folded = foldToString(args[0], stringConsts);
             if (folded) emit(folded, 'MED', 'searchparam_dynamic');
           }
         }
 
-        // FormData.append('field', val)
         if (
           method === 'append' &&
           objName && /^(?:form|fd|formData|body|payload)$/i.test(objName)
@@ -428,14 +443,12 @@ function extract(code) {
           }
         }
 
-        // JSON.stringify({ key: val })
         if (objNode?.type === 'Identifier' && objNode.name === 'JSON' && method === 'stringify') {
           if (args[0]?.type === 'ObjectExpression') {
             for (const k of objectLiteralKeys(args[0])) emit(k, 'HIGH', 'json_stringify');
           }
         }
 
-        // qs.stringify({ key: val }) / querystring.stringify(...)
         if (
           objNode?.type === 'Identifier' &&
           ['qs', 'querystring'].includes(objNode.name) &&
@@ -445,7 +458,6 @@ function extract(code) {
           for (const k of objectLiteralKeys(args[0])) emit(k, 'HIGH', 'qs_stringify');
         }
 
-        // Vue: this.$set(this.form, 'field', val)
         if (
           method === '$set' &&
           args.length >= 2 &&
@@ -457,13 +469,12 @@ function extract(code) {
       }
     },
 
-    // ── MemberExpression handler ────────────────────────────────────────────
+    // ── MemberExpression ──────────────────────────────────────────────────────
     MemberExpression(node) {
       const propName = node.computed
         ? (
             node.property?.type === 'Literal'
               ? node.property.value
-              // Dynamic computed: params[keyVar] — attempt constant fold
               : foldToString(node.property, stringConsts)
           )
         : node.property?.name;
@@ -471,7 +482,6 @@ function extract(code) {
       if (!propName || typeof propName !== 'string') return;
       if (callSitePositions.has(node.start)) return;
 
-      // req.query.user_id / req.body.token
       if (!node.computed && node.object?.type === 'MemberExpression' && !node.object.computed) {
         const root = node.object.object;
         const mid  = node.object.property;
@@ -491,7 +501,6 @@ function extract(code) {
         if (PARAM_PROP_ROOTS.test(objName)) return emit(propName, 'HIGH', 'param_prop_read');
       }
 
-      // body['api_key'] — computed bracket read
       if (
         node.computed &&
         node.object?.type === 'Identifier' &&
@@ -500,7 +509,6 @@ function extract(code) {
         return emit(propName, 'HIGH', 'body_bracket_read');
       }
 
-      // params[keyVar] where keyVar was folded to a string constant
       if (
         node.computed &&
         node.object?.type === 'Identifier' &&
@@ -510,7 +518,7 @@ function extract(code) {
       }
     },
 
-    // ── AssignmentExpression: params['key'] = val ───────────────────────────
+    // ── AssignmentExpression: params['key'] = val ─────────────────────────────
     AssignmentExpression(node) {
       const left = node.left;
       if (left?.type !== 'MemberExpression') return;
@@ -528,6 +536,23 @@ function extract(code) {
         /^(?:body|payload|data|form|req)$/i.test(objName)
       ) {
         emit(keyStr, 'MED', 'assignment_bracket');
+      }
+    },
+
+    // ── Literal: route path params /:param and /[param] ───────────────────────
+    //
+    // Walk every string literal in the AST. If it looks like a route path
+    // (contains /: or /[ before a segment name), extract the param names.
+    //
+    // Covers:
+    //   Express / React Router / Vue Router  →  '/users/:user_id/posts/:post_id'
+    //   Next.js / Nuxt file-based routing     →  '/dashboard/[projectId]/settings'
+    //   Generic path strings                  →  '/api/v1/orders/:order_id/items/:item_id'
+    Literal(node) {
+      if (typeof node.value !== 'string') return;
+      if (!looksLikeRoutePath(node.value)) return;
+      for (const name of extractRouteParams(node.value)) {
+        emit(name, 'MED', 'route_path_param');
       }
     },
 
