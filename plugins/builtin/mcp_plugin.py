@@ -33,6 +33,7 @@ Dependencies
     pip install "mcp[cli]" uvicorn starlette
 """
 
+import glob
 import json
 import os
 import subprocess
@@ -44,11 +45,81 @@ from plugins.base import BasePlugin
 _scans: dict = {}
 _scans_lock  = threading.Lock()
 
+# Root of the jsxray install (two levels up from this file)
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_RECON_DIR = os.path.join(_ROOT, "recon")
+
+
+# ── Disk helpers ─────────────────────────────────────────────────────────────────
+
+def _target_to_safe(target: str) -> str:
+    """Convert a target URL/domain to the directory name JSXray uses on disk."""
+    return target.replace("https://", "").replace("http://", "").replace("/", "_").rstrip("_")
+
+
+def _latest_workspace(target: str) -> str | None:
+    """
+    Return the path to the most recent scan workspace for *target*, or None.
+    Searches recon/<safe_target>/<timestamp>/
+    """
+    safe = _target_to_safe(target)
+    pattern = os.path.join(_RECON_DIR, safe, "*", "summary.json")
+    matches = sorted(glob.glob(pattern))
+    if not matches:
+        # Also try with www. prefix stripped
+        safe2 = safe.replace("www.", "", 1)
+        matches = sorted(glob.glob(os.path.join(_RECON_DIR, safe2, "*", "summary.json")))
+    return os.path.dirname(matches[-1]) if matches else None
+
+
+def _any_latest_workspace() -> str | None:
+    """Return the workspace of the most recently modified scan across all targets."""
+    all_summaries = sorted(
+        glob.glob(os.path.join(_RECON_DIR, "*", "*", "summary.json")),
+        key=os.path.getmtime,
+    )
+    return os.path.dirname(all_summaries[-1]) if all_summaries else None
+
+
+def _load_json(path: str):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _load_lines(path: str) -> list:
+    try:
+        with open(path) as f:
+            return [l.rstrip() for l in f if l.strip() and not l.startswith("#")]
+    except Exception:
+        return []
+
+
+def _read_workspace(ws: str) -> dict:
+    """Load every result file from a workspace directory into a dict."""
+    out = {}
+    out["summary"]              = _load_json(os.path.join(ws, "summary.json")) or {}
+    out["secrets"]              = _load_json(os.path.join(ws, "secrets.json")) or []
+    out["js_secrets_hints"]     = _load_json(os.path.join(ws, "js_secrets_hints.json")) or []
+    out["js_endpoints"]         = _load_json(os.path.join(ws, "js_endpoints.json")) or []
+    out["crawl_endpoints"]      = _load_json(os.path.join(ws, "crawl_endpoints.json")) or []
+    out["js_params"]            = _load_json(os.path.join(ws, "js_params.json")) or {}
+    out["js_global_params"]     = _load_lines(os.path.join(ws, "js_params_flat.txt"))
+    out["js_params_hc"]         = _load_lines(os.path.join(ws, "js_params_high_confidence.txt"))
+    out["hidden_params"]        = _load_json(os.path.join(ws, "source_maps.json")) or {}
+    out["nuclei_targets"]       = _load_lines(os.path.join(ws, "nuclei_targets.txt"))
+    out["robots"]               = _load_json(os.path.join(ws, "robots_paths.json")) or []
+    return out
+
+
+# ── In-memory registry ─────────────────────────────────────────────────────────────
 
 class Plugin(BasePlugin):
     name        = "mcp"
     description = "MCP server — AI can trigger scans and query results"
-    version     = "0.5.0"
+    version     = "0.6.0"
     plugin_type = "mcp"
 
     def __init__(self, config: dict = None):
@@ -78,8 +149,6 @@ class Plugin(BasePlugin):
             mcp_server.run(transport="stdio")
 
 
-# ── Registry ────────────────────────────────────────────────────────────────
-
 def _register_ctx(target, ctx):
     with _scans_lock:
         _scans[target] = {
@@ -87,6 +156,7 @@ def _register_ctx(target, ctx):
             "summary": ctx.to_summary(),
             "started": ctx.scan_start, "elapsed": ctx.elapsed(),
         }
+
 
 def _get_ctx(target):
     if target:
@@ -96,16 +166,49 @@ def _get_ctx(target):
         done = [v for v in _scans.values() if v["status"] == "done" and v.get("ctx")]
     return max(done, key=lambda v: v["started"])["ctx"] if done else None
 
-def _get_summary(target):
+
+def _get_data(target: str) -> dict | None:
+    """
+    Return scan data for *target*.
+    Priority: in-memory ctx  →  in-memory summary  →  disk.
+    Returns a unified dict with keys: summary, secrets, js_endpoints,
+    crawl_endpoints, js_global_params, js_params, js_params_hc,
+    hidden_params, js_secrets_hints, nuclei_targets, robots.
+    """
+    # 1. Try in-memory ctx (live scan result)
+    ctx = _get_ctx(target or None)
+    if ctx:
+        secrets = []
+        for fd in ctx.js_file_data:
+            for s in fd.get("secrets", []):
+                secrets.append({"file": fd.get("url", ""), **s})
+        return {
+            "summary":          ctx.to_summary(),
+            "secrets":          secrets,
+            "js_secrets_hints": [],
+            "js_endpoints":     ctx.js_endpoints or [],
+            "crawl_endpoints":  [],
+            "js_global_params": ctx.js_global_params or [],
+            "js_params":        ctx.js_param_map or {},
+            "js_params_hc":     [],
+            "hidden_params":    ctx.hidden_params or {},
+            "nuclei_targets":   [],
+            "robots":           [],
+        }
+
+    # 2. Try disk
     if target:
-        e = _scans.get(target)
-        return e.get("summary") if e and e["status"] == "done" else None
-    with _scans_lock:
-        done = [v for v in _scans.values() if v["status"] == "done"]
-    return max(done, key=lambda v: v["started"]).get("summary") if done else None
+        ws = _latest_workspace(target)
+    else:
+        ws = _any_latest_workspace()
+
+    if ws:
+        return _read_workspace(ws)
+
+    return None
 
 
-# ── FastMCP tools ───────────────────────────────────────────────────────────
+# ── FastMCP tools ─────────────────────────────────────────────────────────────────
 
 def _build_fastmcp(expose_scan_tool=True):
     from mcp.server.fastmcp import FastMCP
@@ -123,12 +226,11 @@ def _build_fastmcp(expose_scan_tool=True):
                 _scans[target] = {"status": "running", "started": time.time(), "ctx": None}
             def _run():
                 try:
-                    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
                     r = subprocess.run(
-                        [sys.executable, os.path.join(root, "jsxray.py"),
+                        [sys.executable, os.path.join(_ROOT, "jsxray.py"),
                          "-t", target, "-m", mode, "--no-dashboard", "--silent"],
-                        cwd=root, capture_output=True, text=True)
-                    _load_scan_output(target, root, r)
+                        cwd=_ROOT, capture_output=True, text=True)
+                    _load_scan_output(target, _ROOT, r)
                 except Exception as e:
                     with _scans_lock:
                         _scans[target].update({"status": "failed", "error": str(e)})
@@ -141,90 +243,117 @@ def _build_fastmcp(expose_scan_tool=True):
                 scans = dict(_scans)
             if target:
                 e = scans.get(target)
-                if not e: return {"error": f"No scan for '{target}'"}
-                d = {"target": target, "status": e["status"], "elapsed": round(time.time()-e["started"],1)}
+                # Not in memory — check disk
+                if not e:
+                    ws = _latest_workspace(target)
+                    if ws:
+                        summary = _load_json(os.path.join(ws, "summary.json")) or {}
+                        return {
+                            "target":  target,
+                            "status":  "done",
+                            "source":  "disk",
+                            "elapsed": summary.get("elapsed_s", "?"),
+                            "summary": summary,
+                        }
+                    return {"error": f"No scan found for '{target}'"}
+                d = {"target": target, "status": e["status"],
+                     "elapsed": round(time.time() - e["started"], 1)}
                 if e["status"] == "done":   d["summary"] = e.get("summary", {})
                 if e["status"] == "failed": d["error"]   = e.get("error", "unknown")
                 return d
-            return {t: {"status": v["status"], "elapsed": round(time.time()-v["started"],1)}
-                    for t, v in scans.items()}
+            # No target — list all in-memory + all on-disk
+            result = {t: {"status": v["status"],
+                          "elapsed": round(time.time() - v["started"], 1)}
+                     for t, v in scans.items()}
+            # Add disk scans not already in memory
+            for summary_path in sorted(glob.glob(
+                    os.path.join(_RECON_DIR, "*", "*", "summary.json")), key=os.path.getmtime):
+                data = _load_json(summary_path) or {}
+                t = data.get("target", "")
+                if t and t not in result:
+                    result[t] = {"status": "done", "source": "disk",
+                                 "elapsed": data.get("elapsed_s", "?")}
+            return result
 
     @mcp.tool(description="Full scan summary: target, mode, elapsed, tech stack, stats.")
     def jsxray_summary(target: str = "") -> dict:
-        ctx = _get_ctx(target or None)
-        if ctx: return ctx.to_summary()
-        s = _get_summary(target or None)
-        return s if s else {"error": "no results"}
+        d = _get_data(target or None)
+        return d["summary"] if d else {"error": "no results"}
 
     @mcp.tool(description="Endpoints from JS files (fetch, XHR, API paths).")
     def jsxray_js_endpoints(target: str = "", limit: int = 200) -> list:
-        ctx = _get_ctx(target or None)
-        if ctx: return (ctx.js_endpoints or [])[:limit]
-        s = _get_summary(target or None)
-        return s.get("js_endpoints", [])[:limit] if s else []
+        d = _get_data(target or None)
+        if not d:
+            return []
+        eps = list(dict.fromkeys(d["js_endpoints"] + d["crawl_endpoints"]))
+        return eps[:limit]
 
     @mcp.tool(description="Params: global (all JS) and per_file. Filter with file_filter.")
     def jsxray_params(target: str = "", file_filter: str = "") -> dict:
-        ctx = _get_ctx(target or None)
+        d = _get_data(target or None)
+        if not d:
+            return {}
         ff = file_filter.lower()
-        if ctx:
-            return {"global": ctx.js_global_params,
-                    "per_file": {k: v for k, v in ctx.js_param_map.items() if ff in k.lower()}}
-        s = _get_summary(target or None)
-        return {"global": s.get("js_global_params", []), "per_file": {}} if s else {}
+        per_file = {k: v for k, v in d["js_params"].items() if ff in k.lower()} \
+                   if ff else d["js_params"]
+        return {
+            "global":          d["js_global_params"],
+            "high_confidence": d["js_params_hc"],
+            "per_file":        per_file,
+        }
 
     @mcp.tool(description="Secrets/credentials found in JS (API keys, tokens, passwords).")
     def jsxray_secrets(target: str = "") -> list:
-        ctx = _get_ctx(target or None)
-        if ctx:
-            return [{"file": fd.get("url",""), **s}
-                    for fd in ctx.js_file_data for s in fd.get("secrets", [])]
-        s = _get_summary(target or None)
-        return s.get("secrets", []) if s else []
+        d = _get_data(target or None)
+        if not d:
+            return []
+        return d["secrets"] + d.get("js_secrets_hints", [])
 
     @mcp.tool(description="Hidden params from source map parsing. Filter with endpoint_filter.")
     def jsxray_hidden_params(target: str = "", endpoint_filter: str = "") -> dict:
-        ctx = _get_ctx(target or None)
+        d = _get_data(target or None)
+        if not d:
+            return {}
         ef = endpoint_filter.lower()
-        if ctx: return {k: v for k, v in ctx.hidden_params.items() if ef in k.lower()}
-        s = _get_summary(target or None)
-        return {k: v for k, v in s.get("hidden_params",{}).items() if ef in k.lower()} if s else {}
+        hp = d["hidden_params"]
+        return {k: v for k, v in hp.items() if ef in k.lower()} if ef else hp
 
     return mcp
 
 
-# ── Scan output loader ──────────────────────────────────────────────────────────
+# ── Scan output loader ───────────────────────────────────────────────────────────────
 
 def _load_scan_output(target, jsxray_root, proc_result):
-    import glob
-    safe = target.replace("https://","").replace("http://","").replace("/","_")
-    matches = sorted(glob.glob(os.path.join(jsxray_root,"recon",safe,"*","summary.json")))
-    if matches:
+    ws = _latest_workspace(target)
+    if ws:
         try:
-            with open(matches[-1]) as f: summary = json.load(f)
+            summary = _load_json(os.path.join(ws, "summary.json")) or {}
             with _scans_lock:
-                _scans[target].update({"status":"done","summary":summary,
-                                       "elapsed":summary.get("elapsed_s",0)})
+                _scans[target].update({
+                    "status":  "done",
+                    "summary": summary,
+                    "elapsed": summary.get("elapsed_s", 0),
+                })
             return
         except Exception:
             pass
     with _scans_lock:
         if proc_result.returncode != 0:
-            _scans[target].update({"status":"failed",
-                                   "error":proc_result.stderr[-500:] or "unknown"})
+            _scans[target].update({"status": "failed",
+                                   "error": proc_result.stderr[-500:] or "unknown"})
         else:
-            _scans[target].update({"status":"done",
-                                   "summary":{"note":"summary.json not found"}})
+            _scans[target].update({"status": "done",
+                                   "summary": {"note": "summary.json not found"}})
 
 
-# ── Transport ─────────────────────────────────────────────────────────────────
+# ── Transport ─────────────────────────────────────────────────────────────────────────
 
 class _HostBypassMiddleware:
     """
     ASGI middleware that rewrites the Host header to 127.0.0.1:<port>
     before passing the request to FastMCP.
 
-    FastMCP validates the Host header and returns 421 when it doesn’t match
+    FastMCP validates the Host header and returns 421 when it doesn't match
     the bound address (which always happens behind ngrok/Cloudflare/reverse-proxies).
     This middleware normalises the host so FastMCP always sees a local address.
     """
@@ -234,7 +363,6 @@ class _HostBypassMiddleware:
 
     async def __call__(self, scope, receive, send):
         if scope["type"] in ("http", "websocket"):
-            # Replace host header with the actual bound address
             headers = [
                 (b"host", self.host) if k == b"host" else (k, v)
                 for k, v in scope.get("headers", [])
@@ -251,16 +379,11 @@ def _serve(mcp_server, host: str, port: int, blocking: bool = True):
         return
 
     inner_app = mcp_server.streamable_http_app()
-    # Wrap with host-bypass middleware so ngrok/Cloudflare host headers
-    # don't trigger FastMCP's 421 Misdirected Request rejection.
     app = _HostBypassMiddleware(inner_app, "127.0.0.1", port)
 
     config = uvicorn.Config(
-        app,
-        host=host,
-        port=port,
+        app, host=host, port=port,
         log_level="warning",
-        # Disable uvicorn's own h11 host validation
         server_header=False,
         date_header=False,
     )
@@ -273,14 +396,15 @@ def _serve(mcp_server, host: str, port: int, blocking: bool = True):
         threading.Thread(target=srv.run, daemon=True).start()
 
 
-# ── Standalone ───────────────────────────────────────────────────────────────
+# ── Standalone ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--host",      default="127.0.0.1")
     p.add_argument("--port",      type=int, default=9000)
-    p.add_argument("--transport", default="streamable-http", choices=["streamable-http","stdio"])
+    p.add_argument("--transport", default="streamable-http",
+                   choices=["streamable-http", "stdio"])
     args = p.parse_args()
 
     try:
