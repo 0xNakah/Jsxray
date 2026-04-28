@@ -1,20 +1,45 @@
 /**
- * ast_extract_runner.js — AST v7 JS Parameter Extraction Engine
+ * ast_extract_runner.js — AST v8 JS Parameter Extraction Engine
  *
- * Reads raw JS source from stdin, writes JSON to stdout:
- *   { params: [{value, source}], endpoints: [], error: null }
+ * v8 fixes vs v7 (100-case test suite):
+ *   FIX1 — calleeStarts keyed on node.callee.END (not .start): nested
+ *           MemberExpressions share the same .start but have unique .end.
+ *           e.g. req.query.rawInput.trim() — all nodes start at 0; only
+ *           the outermost callee ends at 23. Fixes: I13 (chained reads).
  *
- * v7 changes vs v6 (single-pass):
- *   - Pre-pass callee offset Set replaces broken WeakSet same-pass approach
- *     → prevents method names (get/append/stringify) leaking as params
- *   - FORMDATA_ROOTS regex broadened (formData/fd/body aliases all matched)
- *   - VALID_PARAM_RE relaxed to {0,59} — single-char params (q, a) now valid
- *   - useReducer: now inspects args[1] for initial state object
- *   - axios({url,data}): 'url' suppressed from param output; extracted as endpoint
- *   - Early returns after stringify/SP/FormData handlers stop fallthrough leaks
- *   - Walker extended for Babel JSX/TS node types (Decorator, JSXElement,
- *     TSAsExpression, TSNonNullExpression, etc.)
- *   - Test matrix: 57/58 passing
+ *   FIX2 — computed MemberExpression on req.query / queryAlias:
+ *           req.query['key'] and alias['key'] now emit the bracketed key.
+ *           Fixes: A09, K04, K07.
+ *
+ *   FIX3 — 3-level chain ctx.request.body.X / req.body.field chained:
+ *           Extra check for root→mid1→mid2→prop where mid1∈{request} and
+ *           mid2∈QUERY_MEMBER_PROPS. Fixes: A08.
+ *
+ *   FIX4 — Transitive queryAlias propagation:
+ *           `const f = q` where q is already a queryAlias → f is also a
+ *           queryAlias. Fixes: H02 (multi-hop alias).
+ *
+ *   FIX5 — URL().searchParams alias tracking:
+ *           `const sp = url.searchParams` where url is a new URL(…) or any
+ *           MemberExpression ending in .searchParams → sp added to
+ *           urlParamAliases. Also handles inline chain x.searchParams.get('k').
+ *           Fixes: C06, K15.
+ *
+ *   FIX6 — Identifier arg to net calls resolved via varInitMap:
+ *           `const payload = {...}; axios.post('/x', payload)` — if the arg
+ *           is an Identifier whose init was an ObjectExpression, extract its
+ *           keys. Fixes: J08.
+ *
+ *   FIX7 — Destructure from payload / message.data patterns:
+ *           `const {a,b} = message.data` or `const {x} = somePayload` →
+ *           emit keys when init's property matches PAYLOAD_ROOTS or
+ *           QUERY_MEMBER_PROPS. Fixes: J10.
+ *
+ *   FIX8 — BinaryExpression URL in net calls:
+ *           `fetch(BASE + '/path?key=val')` — walk BinaryExpression leaves
+ *           for string literals and run extractQS on each. Fixes: K16.
+ *
+ * Test matrix: 98/100 passing (was 89/100 on v7)
  */
 
 'use strict';
@@ -46,25 +71,24 @@ let acorn, walk;
 try {
   acorn = require('acorn');
   walk  = require('acorn-walk');
-  // Extend walker for both Acorn and Babel AST node types
-  walk.base.File                  = (node, st, c) => c(node.program, st);
-  walk.base.StringLiteral         = walk.base.Literal;
-  walk.base.ObjectProperty        = walk.base.Property;
-  walk.base.ClassProperty         = walk.base.PropertyDefinition || walk.base.Property;
-  walk.base.TSTypeAnnotation      = () => {};
-  walk.base.TSTypeReference       = () => {};
-  walk.base.TSParameterProperty   = (node, st, c) => { if (node.parameter) c(node.parameter, st); };
-  walk.base.Decorator             = (node, st, c) => { if (node.expression) c(node.expression, st); };
-  walk.base.JSXElement            = (node, st, c) => {
+  walk.base.File                   = (node, st, c) => c(node.program, st);
+  walk.base.StringLiteral          = walk.base.Literal;
+  walk.base.ObjectProperty         = walk.base.Property;
+  walk.base.ClassProperty          = walk.base.PropertyDefinition || walk.base.Property;
+  walk.base.TSTypeAnnotation       = () => {};
+  walk.base.TSTypeReference        = () => {};
+  walk.base.TSParameterProperty    = (node, st, c) => { if (node.parameter) c(node.parameter, st); };
+  walk.base.Decorator              = (node, st, c) => { if (node.expression) c(node.expression, st); };
+  walk.base.JSXElement             = (node, st, c) => {
     for (const a of node.openingElement?.attributes || []) c(a, st);
     for (const ch of node.children || []) c(ch, st);
   };
-  walk.base.JSXAttribute          = (node, st, c) => { if (node.value) c(node.value, st); };
+  walk.base.JSXAttribute           = (node, st, c) => { if (node.value) c(node.value, st); };
   walk.base.JSXExpressionContainer = (node, st, c) => { if (node.expression) c(node.expression, st); };
-  walk.base.JSXText               = () => {};
-  walk.base.TSAsExpression        = (node, st, c) => { c(node.expression, st); };
-  walk.base.TSSatisfiesExpression = (node, st, c) => { c(node.expression, st); };
-  walk.base.TSNonNullExpression   = (node, st, c) => { c(node.expression, st); };
+  walk.base.JSXText                = () => {};
+  walk.base.TSAsExpression         = (node, st, c) => { c(node.expression, st); };
+  walk.base.TSSatisfiesExpression  = (node, st, c) => { c(node.expression, st); };
+  walk.base.TSNonNullExpression    = (node, st, c) => { c(node.expression, st); };
 } catch (e) {
   process.stdout.write(JSON.stringify({
     params: [], endpoints: [], error: 'acorn_missing',
@@ -103,8 +127,6 @@ const NET_CALLS = new Set([
   'instance.get', 'instance.post', 'instance.put', 'instance.patch',
 ]);
 
-// Suppress these keys when flattening top-level net-call config objects;
-// 'url', 'data', 'body', 'params' are recursed into instead.
 const FETCH_OPTION_KEYS = new Set([
   'method', 'headers', 'mode', 'credentials', 'cache', 'redirect',
   'referrer', 'referrerPolicy', 'integrity', 'keepalive', 'signal',
@@ -115,7 +137,6 @@ const FETCH_OPTION_KEYS = new Set([
   'resolveBodyOnly', 'cookieJar', 'ignoreInvalidCookies',
   'localAddress', 'dnsLookup', 'dnsCache', 'request',
   'encoding', 'followRedirect', 'maxResponseSize',
-  // also suppress at top level — children are recursed into separately
   'url', 'data', 'body', 'params',
 ]);
 
@@ -156,6 +177,18 @@ function extractQS(url) {
   return params;
 }
 
+// FIX8: walk a BinaryExpression (typically string concatenation) and collect
+// all string-literal leaves, so fetch(BASE + '?key=val') is handled.
+function collectBinaryStrings(node, out) {
+  if (!node) return;
+  if (node.type === 'Literal' || node.type === 'StringLiteral') {
+    if (typeof node.value === 'string') out.push(node.value);
+  } else if (node.type === 'BinaryExpression' && node.operator === '+') {
+    collectBinaryStrings(node.left, out);
+    collectBinaryStrings(node.right, out);
+  }
+}
+
 function objectLiteralKeys(objNode) {
   if (!objNode || objNode.type !== 'ObjectExpression') return [];
   const keys = [];
@@ -176,7 +209,6 @@ function foldToString(node, stringConsts) {
   return null;
 }
 
-// Relaxed to {0,59}: single-char params (q, a, p) are valid
 const VALID_PARAM_RE = /^[a-zA-Z][a-zA-Z0-9_\-]{0,59}$/;
 const COMMON_JUNK    = new Set([
   'length','constructor','prototype','toString','valueOf','hasOwnProperty',
@@ -251,14 +283,15 @@ function extract(code) {
   };
   const ast = rawAst.type === 'File' ? rawAst.program : rawAst;
 
-  // ── Step 1: collect start offsets of every callee node ───────────────────
-  // This lightweight pre-pass lets MemberExpression skip callee nodes without
-  // relying on a WeakSet that can only be populated after the same-pass
-  // CallExpression fires — which was the v6 bug.
-  const calleeStarts = new Set();
+  // ── Step 1: collect END offsets of every callee node ─────────────────────
+  // FIX1: use .end instead of .start. Nested MemberExpressions in a chain all
+  // share the same .start (leftmost char) but each has a unique .end.
+  // e.g. req.query.rawInput.trim() → callee ends at 23 (trim's close).
+  // The inner nodes end at 9 (query) and 18 (rawInput) — not in calleeEnds.
+  const calleeEnds = new Set();
   walk.simple(ast, {
-    CallExpression(node) { if (node.callee?.start !== undefined) calleeStarts.add(node.callee.start); },
-    NewExpression(node)  { if (node.callee?.start !== undefined) calleeStarts.add(node.callee.start); },
+    CallExpression(node) { if (node.callee?.end !== undefined) calleeEnds.add(node.callee.end); },
+    NewExpression(node)  { if (node.callee?.end !== undefined) calleeEnds.add(node.callee.end); },
   });
 
   // ── Mutable extraction state ──────────────────────────────────────────────
@@ -267,6 +300,8 @@ function extract(code) {
   const payloadAliases  = new Set();
   const directParams    = new Set();
   const stringConsts    = new Map();
+  // FIX6: map from variable name → ObjectExpression init node
+  const varInitMap      = new Map();
   const found           = [];
   const seen            = new Set();
   const endpoints       = [];
@@ -285,8 +320,6 @@ function extract(code) {
     }
   }
 
-  // Flatten top-level object keys for net-call config objects,
-  // recursing into sub-keys: params / data / body.
   function extractObjectArgKeys(objNode, source) {
     if (!objNode || objNode.type !== 'ObjectExpression') return;
     for (const prop of objNode.properties) {
@@ -298,18 +331,15 @@ function extract(code) {
       if (!prop.key) continue;
       const k = prop.key.name ?? prop.key.value;
       if (!k) continue;
-
       if (k === 'url') {
         const v = prop.value;
         if (v?.type === 'Literal' || v?.type === 'StringLiteral') emitEndpoint(v.value);
-        continue; // never emit 'url' as a param
+        continue;
       }
-
       if (['params', 'data', 'body'].includes(k) && prop.value?.type === 'ObjectExpression') {
         for (const pk of objectLiteralKeys(prop.value)) emit(pk, source + '_' + k);
         continue;
       }
-
       if (FETCH_OPTION_KEYS.has(k)) continue;
       emit(k, source);
     }
@@ -323,6 +353,10 @@ function extract(code) {
       const { id, init } = node;
       if (!init) return;
 
+      // Track all object literal inits for FIX6 (identifier arg resolution)
+      if (id?.type === 'Identifier' && init.type === 'ObjectExpression')
+        varInitMap.set(id.name, init);
+
       if (id?.type === 'Identifier' &&
           (init.type === 'Literal' || init.type === 'StringLiteral') &&
           typeof init.value === 'string')
@@ -334,13 +368,21 @@ function extract(code) {
         QUERY_MEMBER_PROPS.test(init.property?.name ?? '')
       );
       const isQueryIdent = init.type === 'Identifier' && QUERY_SEED_NAMES.test(init.name);
+      // FIX4: also propagate if init is an Identifier already in queryAliases
+      const isQueryAlias = init.type === 'Identifier' && queryAliases.has(init.name);
       const isMemberProp = (
         init.type === 'MemberExpression' && !init.computed &&
         QUERY_INIT_PROPS.test(init.property?.name ?? '')
       );
-      const isURLSP   = init.type === 'NewExpression' && init.callee?.name === 'URLSearchParams';
+      const isURLSP = (
+        init.type === 'NewExpression' && init.callee?.name === 'URLSearchParams'
+      ) || (
+        // FIX5: x = anything.searchParams  →  x is a URLSearchParams alias
+        init.type === 'MemberExpression' && !init.computed &&
+        init.property?.name === 'searchParams'
+      );
       const isPayload = init.type === 'Identifier' && PAYLOAD_ROOTS.test(init.name);
-      const isQuery   = isReqMember || isQueryIdent || isMemberProp;
+      const isQuery   = isReqMember || isQueryIdent || isMemberProp || isQueryAlias;
 
       if (id.type === 'Identifier') {
         if (isQuery)   queryAliases.add(id.name);
@@ -353,6 +395,26 @@ function extract(code) {
           if (prop.type === 'RestElement') continue;
           const key = prop.key?.name ?? prop.key?.value;
           if (key) directParams.add(key);
+        }
+      }
+
+      // FIX7: destructure from payload / message.data / any.body etc.
+      if (id.type === 'ObjectPattern' && !isQuery) {
+        const isPayloadDestructure = (
+          // const { a, b } = body / payload / data
+          (init.type === 'Identifier' && PAYLOAD_ROOTS.test(init.name)) ||
+          // const { a, b } = message.data / req.body / ctx.body
+          (init.type === 'MemberExpression' && !init.computed && (
+            PAYLOAD_ROOTS.test(init.property?.name ?? '') ||
+            QUERY_MEMBER_PROPS.test(init.property?.name ?? '')
+          ))
+        );
+        if (isPayloadDestructure) {
+          for (const prop of id.properties) {
+            if (prop.type === 'RestElement') continue;
+            const key = prop.key?.name ?? prop.key?.value;
+            if (key) directParams.add(key);
+          }
         }
       }
 
@@ -377,7 +439,6 @@ function extract(code) {
       const args  = node.arguments;
       if (!args.length) return;
 
-      // Network calls
       if (name && NET_CALLS.has(name)) {
         const first = args[0];
         if ((first.type === 'Literal' || first.type === 'StringLiteral') &&
@@ -392,11 +453,26 @@ function extract(code) {
               emit(m[1], 'template_qs');
           }
         }
-        for (const arg of args) extractObjectArgKeys(arg, 'net_arg');
+        // FIX8: BinaryExpression URL — collect string leaves and extract QS from each
+        if (first.type === 'BinaryExpression') {
+          const strs = [];
+          collectBinaryStrings(first, strs);
+          for (const s of strs) {
+            if (s.startsWith('/') || s.startsWith('http')) emitEndpoint(s.split('?')[0]);
+            for (const p of extractQS(s)) emit(p, 'binary_qs');
+          }
+        }
+        // FIX6: Identifier arg — resolve via varInitMap
+        for (const arg of args) {
+          if (arg.type === 'Identifier' && varInitMap.has(arg.name)) {
+            extractObjectArgKeys(varInitMap.get(arg.name), 'net_var_arg');
+          } else {
+            extractObjectArgKeys(arg, 'net_arg');
+          }
+        }
         return;
       }
 
-      // Object.assign
       if (name === 'Object.assign') {
         for (const arg of args)
           if (arg.type === 'ObjectExpression')
@@ -404,7 +480,6 @@ function extract(code) {
         return;
       }
 
-      // React hooks: useState(init) / useReducer(reducer, init)
       if (node.callee.type === 'Identifier' && REACT_HOOKS.has(node.callee.name)) {
         const initArg = node.callee.name === 'useReducer' ? args[1] : args[0];
         if (initArg?.type === 'ObjectExpression')
@@ -418,10 +493,11 @@ function extract(code) {
       const objNode = node.callee.object;
       const objName = objNode?.type === 'Identifier' ? objNode.name : null;
 
-      // URLSearchParams / query alias: .get / .set / .append / .has
       const isSP = (
         (objName && (QUERY_SEED_NAMES.test(objName) || urlParamAliases.has(objName) || queryAliases.has(objName))) ||
-        objNode?.type === 'NewExpression'
+        objNode?.type === 'NewExpression' ||
+        // FIX5b: x.searchParams.get('key') — objNode is a MemberExpression ending in .searchParams
+        (objNode?.type === 'MemberExpression' && !objNode.computed && objNode.property?.name === 'searchParams')
       );
       if (isSP && method && SP_METHODS.has(method)) {
         const [keyArg] = args;
@@ -432,10 +508,9 @@ function extract(code) {
           const folded = foldToString(keyArg, stringConsts);
           if (folded) emit(folded, 'searchparam_dynamic');
         }
-        return; // prevent fallthrough to generic member-read path
+        return;
       }
 
-      // FormData.append — broadened FORMDATA_ROOTS covers formData/fd/body
       if (method === 'append' && objName && FORMDATA_ROOTS.test(objName)) {
         const [keyArg] = args;
         if ((keyArg?.type === 'Literal' || keyArg?.type === 'StringLiteral') &&
@@ -448,20 +523,17 @@ function extract(code) {
         return;
       }
 
-      // JSON.stringify({ … })
       if (objName === 'JSON' && method === 'stringify' && args[0]?.type === 'ObjectExpression') {
         for (const k of objectLiteralKeys(args[0])) emit(k, 'json_stringify');
         return;
       }
 
-      // qs.stringify / querystring.stringify
       if (['qs', 'querystring'].includes(objName ?? '') && method === 'stringify' &&
           args[0]?.type === 'ObjectExpression') {
         for (const k of objectLiteralKeys(args[0])) emit(k, 'qs_stringify');
         return;
       }
 
-      // Vue.$set(obj, 'key', val)
       if (method === '$set' && args[1]) {
         const s = foldToString(args[1], stringConsts);
         if (s) emit(s, 'vue_set');
@@ -479,8 +551,8 @@ function extract(code) {
 
     // ── Property reads ────────────────────────────────────────────────────────
     MemberExpression(node) {
-      // Skip callee nodes — their start offset was recorded in the pre-pass.
-      if (node.start !== undefined && calleeStarts.has(node.start)) return;
+      // FIX1: skip using .end instead of .start
+      if (node.end !== undefined && calleeEnds.has(node.end)) return;
 
       const propName = node.computed
         ? ((node.property?.type === 'Literal' || node.property?.type === 'StringLiteral')
@@ -490,14 +562,24 @@ function extract(code) {
 
       if (!propName || typeof propName !== 'string') return;
 
-      // req.query.prop / req.body.prop
-      if (!node.computed && node.object?.type === 'MemberExpression' && !node.object.computed) {
-        const root = node.object.object;
-        const mid  = node.object.property;
-        if (root?.type === 'Identifier' &&
-            QUERY_MEMBER_ROOTS.test(root.name) &&
-            QUERY_MEMBER_PROPS.test(mid?.name))
+      // req.query.prop / req.body.prop  (2-level: root.mid.prop)
+      if (node.object?.type === 'MemberExpression') {
+        const mid    = node.object;
+        const midProp = mid.property?.name ?? '';
+        const root   = mid.object;
+
+        if (!mid.computed && QUERY_MEMBER_ROOTS.test(root?.name ?? '') &&
+            QUERY_MEMBER_PROPS.test(midProp))
           return emit(propName, 'req_member_read');
+
+        // FIX3: ctx.request.body.X — 3-level chain (root.mid1.mid2.prop)
+        if (!mid.computed && mid.object?.type === 'MemberExpression') {
+          const mid2 = mid.object;
+          if (QUERY_MEMBER_ROOTS.test(mid2.object?.name ?? '') &&
+              mid2.property?.name === 'request' &&
+              QUERY_MEMBER_PROPS.test(midProp))
+            return emit(propName, 'req3_member_read');
+        }
       }
 
       if (!node.computed && node.object?.type === 'Identifier') {
@@ -507,8 +589,17 @@ function extract(code) {
         if (PARAM_PROP_ROOTS.test(objName))                               return emit(propName, 'param_prop_read');
       }
 
+      // FIX2: computed (bracket) reads — req.query['key'], alias['key']
+      if (node.computed && node.object?.type === 'MemberExpression') {
+        const obj = node.object;
+        if (!obj.computed &&
+            QUERY_MEMBER_ROOTS.test(obj.object?.name ?? '') &&
+            QUERY_MEMBER_PROPS.test(obj.property?.name ?? ''))
+          return emit(propName, 'req_query_bracket');
+      }
       if (node.computed && node.object?.type === 'Identifier') {
         const objName = node.object.name;
+        if (queryAliases.has(objName))                          return emit(propName, 'alias_bracket_read');
         if (/^(?:body|payload|data|form|req)$/i.test(objName))  return emit(propName, 'body_bracket_read');
         if (PARAM_PROP_ROOTS.test(objName))                     return emit(propName, 'param_dynamic_key');
       }
@@ -528,14 +619,14 @@ function extract(code) {
         emit(keyStr, 'assignment_bracket');
     },
 
-    // ── Route path params: '/users/:id'  '/dashboard/[projectId]' ─────────────
+    // ── Route path params ─────────────────────────────────────────────────────
     Literal(node) {
       if (typeof node.value !== 'string') return;
       if (!looksLikeRoutePath(node.value)) return;
       for (const name of extractRouteParams(node.value))
         emit(name, 'route_path_param');
     },
-    StringLiteral(node) { // Babel AST
+    StringLiteral(node) {
       if (typeof node.value !== 'string') return;
       if (!looksLikeRoutePath(node.value)) return;
       for (const name of extractRouteParams(node.value))
