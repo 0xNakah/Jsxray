@@ -15,7 +15,7 @@ Architecture (5 tiers):
             caller (js_extract.py) sees [] and the tool keeps running
 
 Output per param:
-  { "value": "user_id", "confidence": "HIGH"|"MED", "source": "<tier_tag>" }
+  { "value": "user_id", "source": "<tier_tag>" }
 
 Node.js runtime requirement:
   acorn + acorn-walk must be resolvable via `node` in PATH.
@@ -57,9 +57,8 @@ def extract_params_detailed(text: str, log_fn=None) -> list[dict]:
 
     Returns a list of dicts, each with:
         {
-            "value":      str,            # parameter name
-            "confidence": "HIGH" | "MED", # HIGH = structural AST hit
-            "source":     str,            # tier tag, e.g. "req_member_read"
+            "value":  str,  # parameter name
+            "source": str,  # tier tag, e.g. "req_member_read"
         }
 
     Falls back to [] on any error so js_extract.py never crashes.
@@ -101,8 +100,7 @@ def extract_params_detailed(text: str, log_fn=None) -> list[dict]:
 def extract_params(text: str, log_fn=None) -> list[str]:
     """
     Convenience wrapper — returns a flat sorted list of unique param names.
-    Confidence/source metadata is discarded; use extract_params_detailed()
-    when you need per-param confidence scores.
+    Use extract_params_detailed() when you need per-param source tags.
     """
     detailed = extract_params_detailed(text, log_fn=log_fn)
     return sorted({p["value"] for p in detailed})

@@ -74,8 +74,7 @@ function buildAliasMap(ast) {
       }
 
       // FIX 1 — Object.assign(…, req.query, …) or Object.assign(…, existingAlias, …)
-      // Previously only matched Identifier args already in queryAliases.
-      // Now also matches MemberExpression args like req.query directly.
+      // Also matches MemberExpression args like req.query directly.
       if (
         id?.type === 'Identifier' &&
         init.type === 'CallExpression' &&
@@ -113,10 +112,10 @@ function extract(code) {
   const endpoints = [];
   const seenEP    = new Set();
 
-  function emit(value, confidence, source) {
+  function emit(value, source) {
     if (!isValidParam(value) || seen.has(value)) return;
     seen.add(value);
-    found.push({ value, confidence, source });
+    found.push({ value, source });
   }
 
   function emitEndpoint(v) {
@@ -128,13 +127,13 @@ function extract(code) {
 
   // Walk an options object passed to a network call.
   // Keys that are "params", "data", or "body" are unwrapped one level.
-  function walkOptionsObject(objNode, source, confidence) {
+  function walkOptionsObject(objNode, source) {
     if (!objNode || objNode.type !== 'ObjectExpression') return;
 
     for (const prop of objNode.properties) {
       if (prop.type === 'SpreadElement') {
         if (prop.argument?.type === 'ObjectExpression')
-          walkOptionsObject(prop.argument, `${source}_spread`, confidence);
+          walkOptionsObject(prop.argument, `${source}_spread`);
         continue;
       }
       if (!prop.key) continue;
@@ -143,9 +142,9 @@ function extract(code) {
       if (!k) continue;
 
       if (['params', 'data', 'body'].includes(k) && prop.value?.type === 'ObjectExpression') {
-        for (const pk of objectLiteralKeys(prop.value)) emit(pk, 'HIGH', `${source}_body`);
+        for (const pk of objectLiteralKeys(prop.value)) emit(pk, `${source}_body`);
       } else if (!FETCH_OPTION_KEYS.has(k)) {
-        emit(k, confidence, source);
+        emit(k, source);
       }
 
       if (k === 'url' && prop.value?.type === 'Literal') emitEndpoint(prop.value.value);
@@ -160,18 +159,18 @@ function extract(code) {
 
     if (first.type === 'Literal' && typeof first.value === 'string') {
       emitEndpoint(first.value);
-      for (const p of extractQS(first.value)) emit(p, 'HIGH', 'net_call_qs');
+      for (const p of extractQS(first.value)) emit(p, 'net_call_qs');
     }
 
     if (first.type === 'TemplateLiteral') {
       for (const quasi of first.quasis) {
         const raw = quasi.value.cooked ?? quasi.value.raw ?? '';
         for (const m of raw.matchAll(/[?&]([a-zA-Z][a-zA-Z0-9_\-]{1,39})=/g))
-          emit(m[1], 'MED', 'template_qs');
+          emit(m[1], 'template_qs');
       }
     }
 
-    for (const arg of args) walkOptionsObject(arg, 'net_arg', 'HIGH');
+    for (const arg of args) walkOptionsObject(arg, 'net_arg');
   }
 
   function handleSPMethod(node) {
@@ -188,10 +187,10 @@ function extract(code) {
 
     const [keyArg] = node.arguments;
     if (keyArg?.type === 'Literal' && typeof keyArg.value === 'string')
-      emit(keyArg.value, 'HIGH', 'searchparam_call');
+      emit(keyArg.value, 'searchparam_call');
     else if (keyArg?.type === 'Identifier') {
       const folded = foldToString(keyArg, stringConsts);
-      if (folded) emit(folded, 'MED', 'searchparam_dynamic');
+      if (folded) emit(folded, 'searchparam_dynamic');
     }
   }
 
@@ -200,10 +199,10 @@ function extract(code) {
     if (!/^(?:form|fd|formData|body|payload)$/i.test(objName)) return;
     const [keyArg] = node.arguments;
     if (keyArg?.type === 'Literal' && typeof keyArg.value === 'string')
-      emit(keyArg.value, 'HIGH', 'formdata_append');
+      emit(keyArg.value, 'formdata_append');
     else if (keyArg?.type === 'Identifier') {
       const folded = foldToString(keyArg, stringConsts);
-      if (folded) emit(folded, 'MED', 'formdata_dynamic');
+      if (folded) emit(folded, 'formdata_dynamic');
     }
   }
 
@@ -221,13 +220,13 @@ function extract(code) {
       if (name === 'Object.assign')
         for (const arg of args)
           if (arg.type === 'ObjectExpression')
-            for (const k of objectLiteralKeys(arg)) emit(k, 'MED', 'object_assign');
+            for (const k of objectLiteralKeys(arg)) emit(k, 'object_assign');
 
       if (node.callee.type === 'Identifier' && REACT_STATE_HOOKS.has(node.callee.name)) {
         if (args[0]?.type === 'ObjectExpression')
-          for (const k of objectLiteralKeys(args[0])) emit(k, 'MED', 'react_state');
-        if (args[1]?.type === 'ObjectExpression')  // useReducer(reducer, initState)
-          for (const k of objectLiteralKeys(args[1])) emit(k, 'MED', 'react_state');
+          for (const k of objectLiteralKeys(args[0])) emit(k, 'react_state');
+        if (args[1]?.type === 'ObjectExpression')
+          for (const k of objectLiteralKeys(args[1])) emit(k, 'react_state');
       }
 
       if (node.callee.type !== 'MemberExpression') return;
@@ -240,14 +239,14 @@ function extract(code) {
 
       if (node.callee.object?.name === 'JSON' && method === 'stringify')
         if (args[0]?.type === 'ObjectExpression')
-          for (const k of objectLiteralKeys(args[0])) emit(k, 'HIGH', 'json_stringify');
+          for (const k of objectLiteralKeys(args[0])) emit(k, 'json_stringify');
 
       if (['qs', 'querystring'].includes(node.callee.object?.name) && method === 'stringify')
         if (args[0]?.type === 'ObjectExpression')
-          for (const k of objectLiteralKeys(args[0])) emit(k, 'HIGH', 'qs_stringify');
+          for (const k of objectLiteralKeys(args[0])) emit(k, 'qs_stringify');
 
       if (method === '$set' && args[1]?.type === 'Literal' && typeof args[1].value === 'string')
-        emit(args[1].value, 'MED', 'vue_set');
+        emit(args[1].value, 'vue_set');
     },
 
     // new URLSearchParams({ key: val, … })
@@ -255,7 +254,7 @@ function extract(code) {
       if (node.callee?.type !== 'Identifier' || node.callee.name !== 'URLSearchParams') return;
       if (node.arguments[0]?.type !== 'ObjectExpression') return;
       for (const k of objectLiteralKeys(node.arguments[0]))
-        emit(k, 'HIGH', 'urlsearchparams_ctor');
+        emit(k, 'urlsearchparams_ctor');
     },
 
     MemberExpression(node) {
@@ -277,27 +276,25 @@ function extract(code) {
           root?.type === 'Identifier' &&
           QUERY_MEMBER_ROOTS.test(root.name) &&
           QUERY_MEMBER_PROPS.test(mid?.name)
-        ) return emit(propName, 'HIGH', 'req_member_read');
+        ) return emit(propName, 'req_member_read');
       }
 
       if (!node.computed && node.object?.type === 'Identifier') {
         const objName = node.object.name;
-        if (queryAliases.has(objName))      return emit(propName, 'HIGH', 'alias_member_read');
-        // FIX 2 — payload/body/data as function parameter (never registered via VariableDeclarator)
-        // Previously only payloadAliases (built from var declarations) was checked.
-        // Now also match the name directly against PAYLOAD_ROOTS so function params are covered.
+        if (queryAliases.has(objName))      return emit(propName, 'alias_member_read');
+        // FIX 2 — payload/body as function param (never registered via VariableDeclarator)
         if (payloadAliases.has(objName) || PAYLOAD_ROOTS.test(objName))
-          return emit(propName, 'HIGH', 'payload_member_read');
-        if (PARAM_PROP_ROOTS.test(objName)) return emit(propName, 'HIGH', 'param_prop_read');
+          return emit(propName, 'payload_member_read');
+        if (PARAM_PROP_ROOTS.test(objName)) return emit(propName, 'param_prop_read');
       }
 
       // body['key']  /  payload['key']  (computed bracket read)
       if (node.computed && node.object?.type === 'Identifier') {
         const objName = node.object.name;
         if (/^(?:body|payload|data|form|req)$/i.test(objName))
-          return emit(propName, 'HIGH', 'body_bracket_read');
+          return emit(propName, 'body_bracket_read');
         if (PARAM_PROP_ROOTS.test(objName))
-          return emit(propName, 'MED', 'param_dynamic_key');
+          return emit(propName, 'param_dynamic_key');
       }
     },
 
@@ -316,31 +313,30 @@ function extract(code) {
         queryAliases.has(objName) ||
         PARAM_PROP_ROOTS.test(objName) ||
         /^(?:body|payload|data|form|req)$/i.test(objName)
-      ) emit(keyStr, 'MED', 'assignment_bracket');
+      ) emit(keyStr, 'assignment_bracket');
     },
 
     // Route path params:  '/users/:id'  '/dashboard/[projectId]'
-    // Handles both acorn Literal nodes and Babel StringLiteral nodes (from JSX parsing)
     Literal(node) {
       if (typeof node.value !== 'string') return;
       if (!looksLikeRoutePath(node.value)) return;
       for (const name of extractRouteParams(node.value))
-        emit(name, 'MED', 'route_path_param');
+        emit(name, 'route_path_param');
     },
 
-    // FIX 3 — Babel StringLiteral (emitted instead of Literal when @babel/parser handles JSX)
+    // Babel StringLiteral (emitted instead of Literal when @babel/parser handles JSX)
     // Covers: <Route path="/users/:id" />  <Link to="/posts/:slug" />
     StringLiteral(node) {
       if (typeof node.value !== 'string') return;
       if (!looksLikeRoutePath(node.value)) return;
       for (const name of extractRouteParams(node.value))
-        emit(name, 'MED', 'route_path_param_jsx');
+        emit(name, 'route_path_param_jsx');
     },
 
   });
 
   // Flush destructured params collected in Pass 1
-  for (const p of directParams) emit(p, 'HIGH', 'destructure');
+  for (const p of directParams) emit(p, 'destructure');
 
   return {
     params: found,
