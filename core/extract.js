@@ -73,12 +73,19 @@ function buildAliasMap(ast) {
         }
       }
 
-      // Object.assign(…, queryAlias, …)  →  result is also a query alias
+      // FIX 1 — Object.assign(…, req.query, …) or Object.assign(…, existingAlias, …)
+      // Previously only matched Identifier args already in queryAliases.
+      // Now also matches MemberExpression args like req.query directly.
       if (
         id?.type === 'Identifier' &&
         init.type === 'CallExpression' &&
         calleeName(init.callee) === 'Object.assign' &&
-        init.arguments.some(a => a.type === 'Identifier' && queryAliases.has(a.name))
+        init.arguments.some(a =>
+          (a.type === 'Identifier' && queryAliases.has(a.name)) ||
+          (a.type === 'MemberExpression' && !a.computed &&
+           QUERY_MEMBER_ROOTS.test(a.object?.name ?? '') &&
+           QUERY_MEMBER_PROPS.test(a.property?.name ?? ''))
+        )
       ) {
         queryAliases.add(id.name);
       }
@@ -276,7 +283,11 @@ function extract(code) {
       if (!node.computed && node.object?.type === 'Identifier') {
         const objName = node.object.name;
         if (queryAliases.has(objName))      return emit(propName, 'HIGH', 'alias_member_read');
-        if (payloadAliases.has(objName))    return emit(propName, 'HIGH', 'payload_member_read');
+        // FIX 2 — payload/body/data as function parameter (never registered via VariableDeclarator)
+        // Previously only payloadAliases (built from var declarations) was checked.
+        // Now also match the name directly against PAYLOAD_ROOTS so function params are covered.
+        if (payloadAliases.has(objName) || PAYLOAD_ROOTS.test(objName))
+          return emit(propName, 'HIGH', 'payload_member_read');
         if (PARAM_PROP_ROOTS.test(objName)) return emit(propName, 'HIGH', 'param_prop_read');
       }
 
@@ -309,11 +320,21 @@ function extract(code) {
     },
 
     // Route path params:  '/users/:id'  '/dashboard/[projectId]'
+    // Handles both acorn Literal nodes and Babel StringLiteral nodes (from JSX parsing)
     Literal(node) {
       if (typeof node.value !== 'string') return;
       if (!looksLikeRoutePath(node.value)) return;
       for (const name of extractRouteParams(node.value))
         emit(name, 'MED', 'route_path_param');
+    },
+
+    // FIX 3 — Babel StringLiteral (emitted instead of Literal when @babel/parser handles JSX)
+    // Covers: <Route path="/users/:id" />  <Link to="/posts/:slug" />
+    StringLiteral(node) {
+      if (typeof node.value !== 'string') return;
+      if (!looksLikeRoutePath(node.value)) return;
+      for (const name of extractRouteParams(node.value))
+        emit(name, 'MED', 'route_path_param_jsx');
     },
 
   });
